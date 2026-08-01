@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EmergencyDispatch.Api/EmergencyDispatch.Api.csproj" />
+    <Project Path="src/EmergencyDispatch.Domain/EmergencyDispatch.Domain.csproj" />
+    <Project Path="src/EmergencyDispatch.Infrastructure/EmergencyDispatch.Infrastructure.csproj" />
+    <Project Path="src/EmergencyDispatch.Solver/EmergencyDispatch.Solver.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/EmergencyDispatch.Tests/EmergencyDispatch.Tests.csproj" />
+  </Folder>
+</Solution>
