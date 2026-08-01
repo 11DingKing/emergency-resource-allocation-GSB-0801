@@ -12,6 +12,9 @@ public class DispatchDbContext(DbContextOptions<DispatchDbContext> options) : Db
     public DbSet<AllocationPlan> Plans => Set<AllocationPlan>();
     public DbSet<Assignment> Assignments => Set<Assignment>();
     public DbSet<UnassignedTask> UnassignedTasks => Set<UnassignedTask>();
+    public DbSet<RoadEvent> RoadEvents => Set<RoadEvent>();
+    public DbSet<WorldSnapshot> WorldSnapshots => Set<WorldSnapshot>();
+    public DbSet<WorldSnapshotEntry> WorldSnapshotEntries => Set<WorldSnapshotEntry>();
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -59,6 +62,29 @@ public class DispatchDbContext(DbContextOptions<DispatchDbContext> options) : Db
             b.Property(p => p.Status).HasConversion<string>().HasMaxLength(32);
             b.HasMany(p => p.Assignments).WithOne().HasForeignKey(a => a.PlanId);
             b.HasMany(p => p.Unassigned).WithOne().HasForeignKey(u => u.PlanId);
+            b.HasOne(p => p.WorldSnapshot).WithMany().HasForeignKey(p => p.WorldSnapshotId).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        mb.Entity<RoadEvent>(b =>
+        {
+            // 事件 Id 由调用方提供，唯一约束保证同一事件不会重复生效
+            b.HasIndex(e => e.EventId).IsUnique();
+            b.HasOne(e => e.Road).WithMany().HasForeignKey(e => e.RoadId).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        mb.Entity<WorldSnapshot>(b =>
+        {
+            // 内容寻址：相同世界状态只保留一份快照
+            b.HasIndex(s => s.WorldDigest).IsUnique();
+            if (relational) b.Property(s => s.SnapshotVersion).UseIdentityAlwaysColumn();
+            b.HasMany(s => s.Entries).WithOne().HasForeignKey(e => e.WorldSnapshotId);
+        });
+
+        mb.Entity<WorldSnapshotEntry>(b =>
+        {
+            b.Property(e => e.EntityType).HasMaxLength(16);
+            if (relational) b.Property(e => e.ContentJson).HasColumnType("jsonb");
+            b.HasIndex(e => new { e.WorldSnapshotId, e.EntityType, e.Code }).IsUnique();
         });
 
         mb.Entity<Assignment>(b =>

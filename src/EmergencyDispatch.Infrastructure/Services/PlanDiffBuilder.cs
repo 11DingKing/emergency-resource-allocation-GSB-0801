@@ -12,11 +12,20 @@ public sealed record PlanChangeDto(
     AssignmentRefDto? To,
     string Rule);
 
-public sealed record PlanDiffDto(long? FromPlanVersion, long ToPlanVersion, IReadOnlyList<PlanChangeDto> Changes);
+public sealed record SnapshotRefDto(Guid Id, long Version, string WorldDigest);
+
+public sealed record PlanDiffDto(
+    long? FromPlanVersion,
+    long ToPlanVersion,
+    SnapshotRefDto? FromSnapshot,
+    SnapshotRefDto? ToSnapshot,
+    IReadOnlyList<PlanChangeDto> Changes,
+    IReadOnlyList<FieldDiff> WorldChanges);
 
 /// <summary>
 /// 版本间差异。规则文字直接取自求解时落库的同一份 Reasons，
-/// 保证 tie-break、不可分配原因、分配版本与审计解释四者一致。
+/// 世界变化取自两版方案各自绑定的世界快照，
+/// 保证 tie-break、不可分配原因、分配版本、快照与审计解释五者一致。
 /// </summary>
 public static class PlanDiffBuilder
 {
@@ -55,6 +64,28 @@ public static class PlanDiffBuilder
             changes.Add(new PlanChangeDto(u.Task!.Code, u.Task!.Title, "dropped", from, null, rule));
         }
 
-        return new PlanDiffDto(previous?.PlanVersion, current.PlanVersion, changes);
+        var worldChanges = WorldChanges(previous, current);
+
+        return new PlanDiffDto(
+            previous?.PlanVersion,
+            current.PlanVersion,
+            SnapshotRef(previous?.WorldSnapshot),
+            SnapshotRef(current.WorldSnapshot),
+            changes,
+            worldChanges);
     }
+
+    /// <summary>两版方案各自绑定的世界快照之间的字段级差异（道路通断变化归因到道路事件）。</summary>
+    public static IReadOnlyList<FieldDiff> WorldChanges(AllocationPlan? previous, AllocationPlan current)
+    {
+        if (current.WorldSnapshot is null)
+            return Array.Empty<FieldDiff>();
+        var toEntries = current.WorldSnapshot.Entries.Select(WorldSnapshotService.ToInfo).ToList();
+        var fromEntries = previous?.WorldSnapshot?.Entries.Select(WorldSnapshotService.ToInfo).ToList()
+            ?? new List<SnapshotEntryInfo>();
+        return WorldSnapshotService.Diff(fromEntries, toEntries);
+    }
+
+    private static SnapshotRefDto? SnapshotRef(WorldSnapshot? s) =>
+        s is null ? null : new SnapshotRefDto(s.Id, s.SnapshotVersion, s.WorldDigest);
 }

@@ -21,6 +21,7 @@ builder.Services.AddDbContext<DispatchDbContext>(options =>
 // 求解器通过接口注入，与 API、数据库隔离；测试可替换为任意确定性实现
 builder.Services.AddSingleton<IAllocationSolver, DeterministicAllocationSolver>();
 builder.Services.AddScoped<AllocationOrchestrator>();
+builder.Services.AddScoped<WorldSnapshotService>();
 
 var app = builder.Build();
 

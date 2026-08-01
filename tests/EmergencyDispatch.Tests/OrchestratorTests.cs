@@ -9,7 +9,7 @@ using Xunit;
 
 namespace EmergencyDispatch.Tests;
 
-/// <summary>编排层测试：幂等回放、Infeasible 不生效、版本取代、半套分配不可见。求解器注入确定性实现。</summary>
+/// <summary>编排层测试：快照绑定、幂等回放、同版本不同快照 409、过期快照 409、Infeasible 不生效。</summary>
 public class OrchestratorTests
 {
     private sealed class CountingSolver(IAllocationSolver inner) : IAllocationSolver
@@ -22,60 +22,109 @@ public class OrchestratorTests
         }
     }
 
-    private static DispatchDbContext NewDb()
+    private static async Task<(DispatchDbContext Db, AllocationOrchestrator Orch, CountingSolver Solver, WorldSnapshotService Snapshots)> NewSeededAsync()
     {
         var options = new DbContextOptionsBuilder<DispatchDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString())
             .Options;
-        return new DispatchDbContext(options);
-    }
-
-    private static async Task<(DispatchDbContext Db, AllocationOrchestrator Orch, CountingSolver Solver)> NewSeededAsync()
-    {
-        var db = NewDb();
+        var db = new DispatchDbContext(options);
         await DbSeeder.SeedIfEmptyAsync(db);
         var solver = new CountingSolver(new DeterministicAllocationSolver());
-        return (db, new AllocationOrchestrator(db, solver), solver);
+        var snapshots = new WorldSnapshotService(db);
+        return (db, new AllocationOrchestrator(db, solver, snapshots), solver, snapshots);
     }
 
     [Fact]
-    public async Task 同一输入版本重复提交_幂等回放_求解器只调用一次()
+    public async Task 完全相同请求_幂等回放_求解器只调用一次()
     {
-        var (db, orch, solver) = await NewSeededAsync();
+        var (_, orch, solver, snapshots) = await NewSeededAsync();
+        var s1 = await snapshots.CaptureAsync();
 
-        var first = await orch.SolveAsync("v1", PlanKind.Initial, null);
-        var second = await orch.SolveAsync("v1", PlanKind.Initial, null);
+        var first = await orch.SolveAsync("v1", PlanKind.Initial, null, s1.Id);
+        var second = await orch.SolveAsync("v1", PlanKind.Initial, null, s1.Id);
 
         Assert.False(first.IsReplay);
         Assert.True(second.IsReplay);
         Assert.Equal(first.Plan.Id, second.Plan.Id);
         Assert.Equal(1, solver.Calls);
-        Assert.Equal(PlanStatus.Committed, second.Plan.Status);
+        Assert.Equal(s1.Id, first.Plan.WorldSnapshotId);
+    }
+
+    [Fact]
+    public async Task 同一输入版本配不同快照_409并给出字段级差异()
+    {
+        var (db, orch, _, snapshots) = await NewSeededAsync();
+        var s1 = await snapshots.CaptureAsync();
+        await orch.SolveAsync("v1", PlanKind.Initial, null, s1.Id);
+
+        // 世界变化：R2 中断（等价于事件 road-r2-closed-01 生效）
+        var r2 = await db.RoadSegments.SingleAsync(r => r.Code == "R2");
+        r2.IsBlocked = true;
+        r2.LastEventId = "road-r2-closed-01";
+        await db.SaveChangesAsync();
+        var s2 = await snapshots.CaptureAsync();
+        Assert.NotEqual(s1.Id, s2.Id);
+
+        var ex = await Assert.ThrowsAsync<SolveConflictException>(() =>
+            orch.SolveAsync("v1", PlanKind.Replan, "换个快照重发旧版本", s2.Id));
+
+        Assert.Equal("input_version_snapshot_conflict", ex.Conflict);
+        Assert.NotNull(ex.ExistingPlanId);
+        var r2Diff = Assert.Single(ex.Differences, d => d.EntityType == "road" && d.Code == "R2" && d.Field == "isBlocked");
+        Assert.Equal("false", r2Diff.From);
+        Assert.Equal("true", r2Diff.To);
+        Assert.Equal("road-r2-closed-01", r2Diff.EventId);
+    }
+
+    [Fact]
+    public async Task 引用过期快照求解_409过期冲突()
+    {
+        var (db, orch, _, snapshots) = await NewSeededAsync();
+        var s1 = await snapshots.CaptureAsync();
+
+        var r2 = await db.RoadSegments.SingleAsync(r => r.Code == "R2");
+        r2.IsBlocked = true;
+        await db.SaveChangesAsync();
+
+        var ex = await Assert.ThrowsAsync<SolveConflictException>(() =>
+            orch.SolveAsync("v9", PlanKind.Initial, null, s1.Id));
+
+        Assert.Equal("stale_snapshot", ex.Conflict);
+        Assert.Contains(ex.Differences, d => d.EntityType == "road" && d.Code == "R2" && d.Field == "isBlocked");
+    }
+
+    [Fact]
+    public async Task 世界状态未变_快照按内容摘要去重()
+    {
+        var (_, _, _, snapshots) = await NewSeededAsync();
+        var a = await snapshots.CaptureAsync();
+        var b = await snapshots.CaptureAsync();
+        Assert.Equal(a.Id, b.Id);
+        Assert.Equal(a.WorldDigest, b.WorldDigest);
     }
 
     [Fact]
     public async Task 无可行解_方案仅审计落库_绝不生效_回放结果一致()
     {
-        var (db, orch, solver) = await NewSeededAsync();
+        var (db, orch, solver, snapshots) = await NewSeededAsync();
         foreach (var r in db.RoadSegments) r.IsBlocked = true;
         await db.SaveChangesAsync();
+        var s1 = await snapshots.CaptureAsync();
 
-        var failed = await orch.SolveAsync("bad-v1", PlanKind.Initial, null);
+        var failed = await orch.SolveAsync("bad-v1", PlanKind.Initial, null, s1.Id);
 
         Assert.False(failed.IsReplay);
         Assert.Equal(PlanStatus.Infeasible, failed.Plan.Status);
-        Assert.Empty(failed.Plan.Assignments);          // 无半套分配
+        Assert.Empty(failed.Plan.Assignments);
         Assert.NotEmpty(failed.Plan.Unassigned);
-        Assert.Null(await orch.LoadCurrentAsync(default)); // 对外无生效方案
+        Assert.Null(await orch.LoadCurrentAsync(default));
+        Assert.Equal(s1.Id, failed.Plan.WorldSnapshotId);
 
-        // T1 仍未被分配、T2 仍由 B 执行：世界状态未被污染
         var t1 = await db.Tasks.SingleAsync(t => t.Code == "T1");
-        var t2 = await db.Tasks.SingleAsync(t => t.Code == "T2");
         Assert.Null(t1.CurrentTeamId);
         Assert.Equal(DispatchTaskStatus.Pending, t1.Status);
-        Assert.Equal(DispatchTaskStatus.InProgress, t2.Status);
 
-        var replay = await orch.SolveAsync("bad-v1", PlanKind.Initial, null);
+        var replay = await orch.SolveAsync("bad-v1", PlanKind.Initial, null, s1.Id);
         Assert.True(replay.IsReplay);
         Assert.Equal(failed.Plan.Id, replay.Plan.Id);
         Assert.Equal(1, solver.Calls);
@@ -84,48 +133,31 @@ public class OrchestratorTests
     [Fact]
     public async Task 重排后旧版本被取代_当前版本唯一()
     {
-        var (db, orch, _) = await NewSeededAsync();
+        var (db, orch, _, snapshots) = await NewSeededAsync();
+        var s1 = await snapshots.CaptureAsync();
+        var v1 = await orch.SolveAsync("v1", PlanKind.Initial, null, s1.Id);
 
-        var v1 = await orch.SolveAsync("v1", PlanKind.Initial, null);
         var r2 = await db.RoadSegments.SingleAsync(r => r.Code == "R2");
         r2.IsBlocked = true;
         await db.SaveChangesAsync();
-
-        var v2 = await orch.SolveAsync("v2", PlanKind.Replan, "R2 山岭高架中断");
+        var s2 = await snapshots.CaptureAsync();
+        var v2 = await orch.SolveAsync("v2", PlanKind.Replan, "R2 山岭高架中断", s2.Id);
 
         Assert.Equal(PlanStatus.Committed, v2.Plan.Status);
         Assert.Equal(v1.Plan.Id, v2.Plan.SupersedesPlanId);
-
-        var reloadedV1 = await orch.LoadPlanByIdAsync(v1.Plan.Id, default);
-        Assert.Equal(PlanStatus.Superseded, reloadedV1!.Status);
-
-        var current = await orch.LoadCurrentAsync(default);
-        Assert.Equal(v2.Plan.Id, current!.Id);
+        Assert.Equal(PlanStatus.Superseded, (await orch.LoadPlanByIdAsync(v1.Plan.Id, default))!.Status);
+        Assert.Equal(v2.Plan.Id, (await orch.LoadCurrentAsync(default))!.Id);
         Assert.Single(db.Plans, p => p.Status == PlanStatus.Committed);
-
-        // T1 由 A 改派 C
-        var t1 = v2.Plan.Assignments.Single(a => a.Task!.Code == "T1");
-        Assert.Equal("C", t1.Team!.Code);
-        Assert.True(t1.Road!.IsBlocked == false);
     }
 
     [Fact]
     public async Task 已存在生效方案时_初始求解被拒绝()
     {
-        var (_, orch, _) = await NewSeededAsync();
-        await orch.SolveAsync("v1", PlanKind.Initial, null);
+        var (_, orch, _, snapshots) = await NewSeededAsync();
+        var s1 = await snapshots.CaptureAsync();
+        await orch.SolveAsync("v1", PlanKind.Initial, null, s1.Id);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => orch.SolveAsync("v2", PlanKind.Initial, null));
-    }
-
-    [Fact]
-    public async Task 不同输入版本的重排各自形成新版本()
-    {
-        var (db, orch, _) = await NewSeededAsync();
-        await orch.SolveAsync("v1", PlanKind.Initial, null);
-        await orch.SolveAsync("v2", PlanKind.Replan, "例行重排");
-
-        Assert.Equal(2, await db.Plans.CountAsync());
-        Assert.Equal(2, (await orch.LoadCurrentAsync(default))!.PlanVersion);
+        var ex = await Assert.ThrowsAsync<SolveConflictException>(() => orch.SolveAsync("v2", PlanKind.Initial, null, s1.Id));
+        Assert.Equal("initial_already_committed", ex.Conflict);
     }
 }

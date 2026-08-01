@@ -1,10 +1,24 @@
+using System.Text.Json;
 using EmergencyDispatch.Domain;
 
 namespace EmergencyDispatch.Api.Contracts;
 
-public sealed record SolveRequestDto(string InputVersion, string Kind, string? Reason);
+public sealed record SolveRequestDto(string InputVersion, string Kind, string? Reason, Guid WorldSnapshotId);
 
 public sealed record ReasonDto(string Code, string Message);
+
+public sealed record SnapshotEntryDto(string EntityType, string Code, string Digest, JsonElement Content);
+
+public sealed record SnapshotDto(
+    Guid Id,
+    long Version,
+    string WorldDigest,
+    DateTimeOffset CreatedAtUtc,
+    IReadOnlyList<SnapshotEntryDto> Entries);
+
+public sealed record RoadEventRequestDto(string EventId, string RoadCode, bool IsBlocked, string? Note);
+
+public sealed record RoadEventDto(Guid Id, string EventId, string RoadCode, bool IsBlocked, string? Note, DateTimeOffset RecordedAtUtc);
 
 public sealed record AssignmentDto(
     string TaskCode,
@@ -31,6 +45,9 @@ public sealed record PlanDto(
     string? Reason,
     int TotalCostMinutes,
     DateTimeOffset CreatedAtUtc,
+    Guid? WorldSnapshotId,
+    long? WorldSnapshotVersion,
+    string? WorldDigest,
     IReadOnlyList<AssignmentDto> Assignments,
     IReadOnlyList<UnassignedDto> Unassigned);
 
@@ -65,6 +82,9 @@ public static class PlanMapper
         p.Reason,
         p.TotalCostMinutes,
         p.CreatedAtUtc,
+        p.WorldSnapshotId,
+        p.WorldSnapshot?.SnapshotVersion,
+        p.WorldSnapshot?.WorldDigest,
         p.Assignments.OrderBy(a => a.Task!.Code, StringComparer.Ordinal).Select(a => new AssignmentDto(
             a.Task!.Code,
             a.Task!.Title,
@@ -82,4 +102,15 @@ public static class PlanMapper
             u.Task!.Code,
             u.Task!.Title,
             u.Reasons.Select(r => new ReasonDto(r.Code, r.Message)).ToArray())).ToArray());
+
+    public static SnapshotDto ToDto(WorldSnapshot s) => new(
+        s.Id,
+        s.SnapshotVersion,
+        s.WorldDigest,
+        s.CreatedAtUtc,
+        s.Entries
+            .OrderBy(e => e.EntityType, StringComparer.Ordinal)
+            .ThenBy(e => e.Code, StringComparer.Ordinal)
+            .Select(e => new SnapshotEntryDto(e.EntityType, e.Code, e.Digest, JsonDocument.Parse(e.ContentJson).RootElement))
+            .ToArray());
 }

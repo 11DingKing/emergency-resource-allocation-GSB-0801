@@ -10,13 +10,16 @@ namespace EmergencyDispatch.Api.Controllers;
 [Route("api/allocations")]
 public class AllocationsController(AllocationOrchestrator orchestrator) : ControllerBase
 {
-    /// <summary>初始求解 / 重排。同一 inputVersion 重复或并发提交返回同一方案（幂等）。</summary>
+    /// <summary>
+    /// 初始求解 / 重排。请求必须引用世界快照（worldSnapshotId）。
+    /// 完全相同（inputVersion + 同一快照）→ 幂等回放；同 inputVersion 配不同快照 → 409 + 字段级差异。
+    /// </summary>
     [HttpPost("solve")]
     [ProducesResponseType(typeof(PlanDto), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(PlanDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(PlanDto), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status409Conflict)]
+    [ProducesResponseType(typeof(object), StatusCodes.Status409Conflict)]
     public async Task<IActionResult> Solve([FromBody] SolveRequestDto dto, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(dto.InputVersion) || dto.InputVersion.Length > 128)
@@ -28,14 +31,25 @@ public class AllocationsController(AllocationOrchestrator orchestrator) : Contro
         if (kind == PlanKind.Replan && string.IsNullOrWhiteSpace(dto.Reason))
             return BadRequestProblem("replan 必须填写 reason（触发原因将记入审计）。");
 
+        if (dto.WorldSnapshotId == Guid.Empty)
+            return BadRequestProblem("worldSnapshotId 必填：求解请求必须绑定一个世界快照（POST /api/world/snapshots 获取）。");
+
         SolveOutcome outcome;
         try
         {
-            outcome = await orchestrator.SolveAsync(dto.InputVersion, kind, dto.Reason, ct);
+            outcome = await orchestrator.SolveAsync(dto.InputVersion, kind, dto.Reason, dto.WorldSnapshotId, ct);
         }
-        catch (InvalidOperationException ex)
+        catch (SolveConflictException ex)
         {
-            return Conflict(new ProblemDetails { Title = "状态冲突", Detail = ex.Message, Status = StatusCodes.Status409Conflict });
+            return Conflict(new
+            {
+                title = "快照冲突",
+                status = StatusCodes.Status409Conflict,
+                conflict = ex.Conflict,
+                detail = ex.Message,
+                existingPlanId = ex.ExistingPlanId,
+                differences = ex.Differences
+            });
         }
 
         var body = PlanMapper.ToDto(outcome.Plan);
@@ -96,11 +110,19 @@ public class AllocationsController(AllocationOrchestrator orchestrator) : Contro
             .Distinct()
             .ToArray();
 
+        // 道路事件归因（如 road-r2-closed-01）来自两版方案绑定的世界快照字段级差异
+        var roadEvents = diff.WorldChanges
+            .Where(w => w.EventId is not null)
+            .Select(w => new { eventId = w.EventId, roadCode = w.Code, field = w.Field, from = w.From, to = w.To })
+            .Distinct()
+            .ToArray();
+
         return Ok(new
         {
             plan = PlanMapper.ToDto(plan),
             diff,
             notes,
+            roadEvents,
             rules = new[]
             {
                 "执行中任务默认不可抢占（locked_in_progress）",
@@ -108,7 +130,8 @@ public class AllocationsController(AllocationOrchestrator orchestrator) : Contro
                 "能力为稳定字符串集合，必须全部满足（capability_missing）",
                 "车辆高度不得超过道路限高（height_exceeded），道路中断不可通行（road_blocked）",
                 "到达时间不得超过任务时限（deadline_exceeded），时长统一为分钟",
-                "目标为全局总成本（ETA 之和）最低；并列时按队伍编码字典序决胜（tie_break_team_code）"
+                "目标为全局总成本（ETA 之和）最低；并列时按队伍编码字典序决胜（tie_break_team_code）",
+                "求解请求必须绑定世界快照；同 inputVersion 配不同快照返回 409 与字段级差异"
             }
         });
     }

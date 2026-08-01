@@ -29,6 +29,45 @@ public class RoadSegment
     public decimal MaxVehicleHeightMeters { get; set; }
     public int TravelMinutes { get; set; }
     public bool IsBlocked { get; set; }
+    /// <summary>最近一次改变该路段状态的道路事件 Id（用于审计归因）。</summary>
+    public string? LastEventId { get; set; }
+}
+
+/// <summary>道路事件。EventId 由调用方提供并参与幂等控制（唯一约束）。</summary>
+public class RoadEvent
+{
+    public Guid Id { get; set; }
+    public required string EventId { get; set; }
+    public Guid RoadId { get; set; }
+    public RoadSegment? Road { get; set; }
+    public bool IsBlocked { get; set; }
+    public string? Note { get; set; }
+    public DateTimeOffset RecordedAtUtc { get; set; }
+}
+
+/// <summary>
+/// 世界快照：一次求解所见的道路/任务/队伍/车辆全量内容摘要。
+/// 按 WorldDigest 去重（内容寻址），求解请求必须引用一个快照。
+/// </summary>
+public class WorldSnapshot
+{
+    public Guid Id { get; set; }
+    public long SnapshotVersion { get; set; }
+    public required string WorldDigest { get; set; }
+    public DateTimeOffset CreatedAtUtc { get; set; }
+    public List<WorldSnapshotEntry> Entries { get; set; } = new();
+}
+
+/// <summary>快照内单个实体的内容摘要与字段内容（用于字段级差异对比）。</summary>
+public class WorldSnapshotEntry
+{
+    public Guid Id { get; set; }
+    public Guid WorldSnapshotId { get; set; }
+    public required string EntityType { get; set; } // road | task | team | vehicle
+    public Guid EntityId { get; set; }
+    public required string Code { get; set; }
+    public required string Digest { get; set; }
+    public required string ContentJson { get; set; }
 }
 
 /// <summary>调度任务。DeadlineMinutes 为最大到达分钟数，null 表示无到达时限。</summary>
@@ -62,6 +101,9 @@ public class AllocationPlan
     public int TotalCostMinutes { get; set; }
     public DateTimeOffset CreatedAtUtc { get; set; }
     public Guid? SupersedesPlanId { get; set; }
+    /// <summary>本次求解实际采用的世界快照（道路/任务/队伍/车辆内容摘要）。</summary>
+    public Guid? WorldSnapshotId { get; set; }
+    public WorldSnapshot? WorldSnapshot { get; set; }
     public List<Assignment> Assignments { get; set; } = new();
     public List<UnassignedTask> Unassigned { get; set; } = new();
 }

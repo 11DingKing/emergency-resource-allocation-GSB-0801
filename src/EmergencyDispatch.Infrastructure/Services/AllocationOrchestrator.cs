@@ -9,27 +9,44 @@ namespace EmergencyDispatch.Infrastructure.Services;
 
 public sealed record SolveOutcome(AllocationPlan Plan, bool IsReplay);
 
+/// <summary>求解冲突（HTTP 409）：过期快照 / 同输入版本不同快照 / 重复初始求解。</summary>
+public sealed class SolveConflictException(
+    string conflict,
+    string detail,
+    IReadOnlyList<FieldDiff> differences,
+    Guid? existingPlanId = null) : Exception(detail)
+{
+    public string Conflict { get; } = conflict;
+    public IReadOnlyList<FieldDiff> Differences { get; } = differences;
+    public Guid? ExistingPlanId { get; } = existingPlanId;
+}
+
 /// <summary>
-/// 调度编排：在 API 与求解器之间做事务、幂等与审计。
-/// - 道路/任务快照在 RepeatableRead 事务内一次性读取，求解中途的外部变更不会混入本次求解；
-/// - InputVersion 唯一约束兜底并发重复提交，唯一冲突/序列化失败/乐观并发失败 → 回滚重试 → 幂等回放；
+/// 调度编排：在 API 与求解器之间做事务、幂等、快照绑定与审计。
+/// - 求解请求必须引用世界快照；快照与当前世界摘要不一致 → 409 stale_snapshot（字段级差异）；
+/// - 同一 inputVersion 配不同快照 → 409 input_version_snapshot_conflict（字段级差异），绝不把旧方案伪装成成功；
+/// - 完全相同的请求（inputVersion + 同一快照）→ 幂等回放同一方案；
 /// - 方案、分配、任务状态、旧版本作废全部在同一事务提交，半套分配永远不会被外界看到。
 /// </summary>
-public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolver solver)
+public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolver solver, WorldSnapshotService snapshots)
 {
     private const int MaxAttempts = 5;
 
-    public async Task<SolveOutcome> SolveAsync(string inputVersion, PlanKind kind, string? reason, CancellationToken ct = default)
+    public async Task<SolveOutcome> SolveAsync(
+        string inputVersion, PlanKind kind, string? reason, Guid worldSnapshotId, CancellationToken ct = default)
     {
         var transactional = db.Database.IsRelational();
+        var referenced = await snapshots.LoadAsync(worldSnapshotId, ct)
+            ?? throw new SolveConflictException("unknown_snapshot",
+                $"世界快照 {worldSnapshotId} 不存在，请先 POST /api/world/snapshots 捕获。", Array.Empty<FieldDiff>());
+        var referencedEntries = referenced.Entries.Select(WorldSnapshotService.ToInfo).ToList();
 
         for (var attempt = 1; ; attempt++)
         {
             var existing = await LoadPlanByInputVersionAsync(inputVersion, ct);
             if (existing is not null)
-                return new SolveOutcome(existing, IsReplay: true);
+                return ReplayOrConflict(existing, referenced, referencedEntries);
 
-            // 关系库用 RepeatableRead 保证快照一致与原子提交；InMemory（测试）无事务概念，直接执行
             await using var tx = transactional
                 ? await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
                 : null;
@@ -38,14 +55,26 @@ public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolv
                 existing = await LoadPlanByInputVersionAsync(inputVersion, ct);
                 if (existing is not null)
                 {
+                    var outcome = ReplayOrConflict(existing, referenced, referencedEntries);
                     if (tx is not null) await tx.CommitAsync(ct);
-                    return new SolveOutcome(existing, IsReplay: true);
+                    return outcome;
                 }
 
                 if (kind == PlanKind.Initial && await db.Plans.AnyAsync(p => p.Status == PlanStatus.Committed, ct))
-                    throw new InvalidOperationException("已存在生效中的分配方案，初始求解只能执行一次，请使用 replan。");
+                    throw new SolveConflictException("initial_already_committed",
+                        "已存在生效中的分配方案，初始求解只能执行一次，请使用 replan。", Array.Empty<FieldDiff>());
 
-                // 一次性读取一致性快照（RepeatableRead 保证多语句同一快照）
+                // 快照必须等于当前世界状态（RepeatableRead 内一致读取），否则为过期引用
+                var currentEntries = await snapshots.BuildCurrentEntriesAsync(ct);
+                var currentDigest = WorldSnapshotService.ComputeWorldDigest(currentEntries);
+                if (!string.Equals(currentDigest, referenced.WorldDigest, StringComparison.Ordinal))
+                {
+                    throw new SolveConflictException("stale_snapshot",
+                        $"引用的世界快照 v{referenced.SnapshotVersion} 已过期，与当前世界状态不一致，请重新捕获后再求解。",
+                        WorldSnapshotService.Diff(referencedEntries, currentEntries));
+                }
+
+                // 一次性读取一致性快照（与上方摘要校验同一事务快照）
                 var teams = await db.Teams.Include(t => t.Vehicle).ToListAsync(ct);
                 var tasks = await db.Tasks.ToListAsync(ct);
                 var roads = await db.RoadSegments.ToListAsync(ct);
@@ -76,7 +105,8 @@ public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolv
                     Reason = reason,
                     CreatedAtUtc = DateTimeOffset.UtcNow,
                     Status = result.IsFeasible ? PlanStatus.Committed : PlanStatus.Infeasible,
-                    TotalCostMinutes = result.TotalCostMinutes
+                    TotalCostMinutes = result.TotalCostMinutes,
+                    WorldSnapshotId = referenced.Id
                 };
 
                 // 关系库由 identity 列生成版本号；非关系提供程序（测试）显式递增
@@ -137,11 +167,26 @@ public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolv
             }
             catch (Exception ex) when (attempt < MaxAttempts && IsRetryable(ex))
             {
-                // 并发同一输入版本 / 求解中途快照被更新：回滚后重试，重试时走幂等回放或基于新快照重解
+                // 并发同一输入版本 / 求解中途快照被更新：回滚后重试，重试时走幂等回放、冲突或基于新快照重解
                 if (tx is not null) await tx.RollbackAsync(ct);
                 db.ChangeTracker.Clear();
             }
         }
+    }
+
+    /// <summary>同 inputVersion：快照一致 → 幂等回放；快照不同 → 409 + 字段级差异，绝不伪装成功。</summary>
+    private static SolveOutcome ReplayOrConflict(AllocationPlan existing, WorldSnapshot referenced, List<SnapshotEntryInfo> referencedEntries)
+    {
+        if (existing.WorldSnapshotId == referenced.Id)
+            return new SolveOutcome(existing, IsReplay: true);
+
+        var existingEntries = existing.WorldSnapshot?.Entries.Select(WorldSnapshotService.ToInfo).ToList()
+            ?? new List<SnapshotEntryInfo>();
+        throw new SolveConflictException("input_version_snapshot_conflict",
+            $"inputVersion '{existing.InputVersion}' 已绑定世界快照 v{existing.WorldSnapshot?.SnapshotVersion}，" +
+            $"与本次引用的 v{referenced.SnapshotVersion} 不一致；如需基于新世界状态求解，请使用新的 inputVersion。",
+            WorldSnapshotService.Diff(existingEntries, referencedEntries),
+            existing.Id);
     }
 
     public Task<AllocationPlan?> LoadPlanByInputVersionAsync(string inputVersion, CancellationToken ct) =>
@@ -159,7 +204,8 @@ public sealed class AllocationOrchestrator(DispatchDbContext db, IAllocationSolv
             .Include(p => p.Assignments).ThenInclude(a => a.Task)
             .Include(p => p.Assignments).ThenInclude(a => a.Team).ThenInclude(t => t!.Vehicle)
             .Include(p => p.Assignments).ThenInclude(a => a.Road)
-            .Include(p => p.Unassigned).ThenInclude(u => u.Task);
+            .Include(p => p.Unassigned).ThenInclude(u => u.Task)
+            .Include(p => p.WorldSnapshot).ThenInclude(s => s!.Entries);
         return db.Database.IsRelational() ? query.AsSplitQuery() : query;
     }
 
