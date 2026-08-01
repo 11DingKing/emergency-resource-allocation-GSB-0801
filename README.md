@@ -96,10 +96,12 @@ Candidates are ordered by **arrival minutes**, then ordinal `teamCode`, `vehicle
 | `GET /api/allocations/{versionNumber}` | Fetch a version. |
 | `GET /api/allocations/latest` | Fetch the latest version. |
 | `GET /api/allocations/{versionNumber}/explanation` | Ordered audit trail + assignments + unassigned reasons + road events. |
+| `GET /api/allocations/{versionNumber}/diff/{againstVersionNumber}` | Traceable diff of one version vs an earlier one: snapshot field changes + per-task assignment changes + road events. |
 | `POST /api/roads/events` | Record a road event. Body `{ "eventId": "road-r2-closed-01", "roadCode": "R2", "closed": true }`. Idempotent on `eventId`. |
 | `GET /api/roads` | List road segments and open/closed state. |
 | `PUT /api/roads/{code}/state` | Cut/reopen a road directly (no event id). Body `{ "isOpen": false }`. |
 | `PUT /api/tasks/{code}/danger` | Set a task's danger level. Body `{ "dangerLevel": "critical" }`. |
+| `PUT /api/tasks/{code}/execute` | Mark a task executed (in progress), pinning it to the latest plan's crew. It then stays fixed and is never moved by a later replan. |
 
 OpenAPI document is served at `GET /openapi/v1.json` in Development.
 
@@ -202,6 +204,40 @@ snapshot digest, the API returns **`409`** with a field-level diff citing `road[
 
 ---
 
+## Worked example (round 3): reopen the road, mark T1 executed, replan
+
+Flow: `POST /api/roads/events road-r2-open-02` (reopen `R2`) →
+`PUT /api/tasks/T1/execute` (T1 is now executing) →
+replan as `r2-reopened-v2`.
+
+Even though `R2` is open again and its route (20 min) is faster than T1's current 30 min over
+`R1`, **an executed task is never moved**:
+
+```
+version=3 kind=Replan
+  ASSIGN T1 -> team A, vehicle V-HIGH, road ON-SITE, arrive 0min   (held, executing)
+  ASSIGN T2 -> team B, vehicle V-LOW,  road ON-SITE, arrive 0min
+  AUDIT [NON_PREEMPTION_HELD] T1: Task T1 is in progress and held with team A; not preemptable.
+  AUDIT [NON_PREEMPTION_HELD] T2: Task T2 is in progress and held with team B; not preemptable.
+```
+
+### The diff, and the rule behind each change (`GET /api/allocations/3/diff/2`)
+
+| Change | Round 2 | Round 3 | Rule (references) |
+| --- | --- | --- | --- |
+| `road[R2].isOpen` | `False` | `True` | `road-r2-open-02` reopened `R2`. |
+| `road[R2].lastEventId` | `road-r2-closed-01` | `road-r2-open-02` | Event attribution in the snapshot diff. |
+| `task[T1].status` | `Pending` | `InProgress` | `T1` marked executed. |
+| `T1` assignment | `R1`, 30 min | `ON-SITE`, 0 min | **`NON_PREEMPTION_HELD`** — executing task pinned; the shorter reopened-R2 ETA is deliberately **not** taken. |
+| `T2` | unchanged | unchanged | `NON_PREEMPTION_HELD`. |
+
+**Old-snapshot conflict.** If a concurrent submit reuses `inputVersion = r2-reopened-v2` but
+carries the **stale** snapshot digest that omitted `road-r2-open-02`, it gets **`409`** — the
+old plan is never replayed. The current (latest) plan points to the **winning** world snapshot,
+and the round-3 plan stays fully diff-traceable against round 2 via the `diff` endpoint.
+
+---
+
 ## Edge cases exercised by the tests ([tests/EmergencyDispatch.Tests](tests/EmergencyDispatch.Tests))
 
 - **No feasible solution** — all roads cut ⇒ `NO_FEASIBLE_ROUTE`; no capable team ⇒
@@ -215,5 +251,9 @@ snapshot digest, the API returns **`409`** with a field-level diff citing `road[
   **different snapshots ⇒ the stale request never creates or replays a plan** (409).
 - **Road events + danger escalation** — a reroute cites the `road-r2-closed-01` event; a danger
   rise to `critical` is recorded and gates (but here does not trigger) `T2` preemption.
+- **Executed task is never moved** — after `road-r2-open-02` reopens `R2` and `T1` is marked
+  executed, a replan keeps `T1` on-site (`NON_PREEMPTION_HELD`) despite the shorter reopened-road
+  ETA; a stale snapshot missing the reopen event conflicts, the latest plan points to the winning
+  snapshot, and the round-3 plan is diff-traceable against round 2.
 - **Consistency** — deterministic tie-break, unassignable reasons, allocation version, snapshot
   digest and audit explanation all agree; a half-written plan is never externally visible.

@@ -236,3 +236,54 @@ public sealed record FieldChangeDto
         Current = f.Current,
     };
 }
+
+/// <summary>Traceable diff between two allocation versions (snapshot + per-task assignments).</summary>
+public sealed record VersionDiffDto
+{
+    public required int VersionNumber { get; init; }
+    public required int AgainstVersionNumber { get; init; }
+    public required string SnapshotVersion { get; init; }
+    public required string AgainstSnapshotVersion { get; init; }
+    public required IReadOnlyList<FieldChangeDto> SnapshotChanges { get; init; }
+    public required IReadOnlyList<AssignmentChangeDto> AssignmentChanges { get; init; }
+    public required IReadOnlyList<RoadEventDto> RoadEvents { get; init; }
+
+    public static VersionDiffDto From(VersionDiff d) => new()
+    {
+        VersionNumber = d.VersionNumber,
+        AgainstVersionNumber = d.AgainstVersionNumber,
+        SnapshotVersion = d.SnapshotVersion,
+        AgainstSnapshotVersion = d.AgainstSnapshotVersion,
+        SnapshotChanges = d.SnapshotDiff.Changes.Select(FieldChangeDto.From).ToList(),
+        AssignmentChanges = d.AssignmentChanges.Select(AssignmentChangeDto.From).ToList(),
+        RoadEvents = d.RoadEvents.Select(RoadEventDto.From).ToList(),
+    };
+}
+
+public sealed record AssignmentChangeDto
+{
+    public required string TaskCode { get; init; }
+    public required string Kind { get; init; }
+    public string? BeforeTeamCode { get; init; }
+    public string? BeforeVehicleCode { get; init; }
+    public string? BeforeRoadCode { get; init; }
+    public int? BeforeArrivalMinutes { get; init; }
+    public string? AfterTeamCode { get; init; }
+    public string? AfterVehicleCode { get; init; }
+    public string? AfterRoadCode { get; init; }
+    public int? AfterArrivalMinutes { get; init; }
+
+    public static AssignmentChangeDto From(AssignmentChange c) => new()
+    {
+        TaskCode = c.TaskCode,
+        Kind = c.Kind,
+        BeforeTeamCode = c.BeforeTeamCode,
+        BeforeVehicleCode = c.BeforeVehicleCode,
+        BeforeRoadCode = c.BeforeRoadCode,
+        BeforeArrivalMinutes = c.BeforeArrivalMinutes,
+        AfterTeamCode = c.AfterTeamCode,
+        AfterVehicleCode = c.AfterVehicleCode,
+        AfterRoadCode = c.AfterRoadCode,
+        AfterArrivalMinutes = c.AfterArrivalMinutes,
+    };
+}

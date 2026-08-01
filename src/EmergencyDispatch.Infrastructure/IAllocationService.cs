@@ -36,6 +36,14 @@ public interface IAllocationService
     /// <summary>Update a task's danger level to a stable danger-level name (e.g. "critical").</summary>
     Task<bool> SetTaskDangerAsync(string taskCode, string dangerLevel, CancellationToken ct = default);
 
+    /// <summary>
+    /// Mark a task as executed (in progress), pinning it to the crew that the latest allocation
+    /// version assigned to it. Once executed a task is non-preemptable and is never moved by a
+    /// later replan — not even when a reopened road offers a shorter ETA. Returns false when the
+    /// task is unknown or has no assignment in the latest plan to pin.
+    /// </summary>
+    Task<bool> MarkTaskExecutedAsync(string taskCode, CancellationToken ct = default);
+
     Task<AllocationVersion?> GetVersionAsync(int versionNumber, CancellationToken ct = default);
 
     Task<AllocationVersion?> GetByInputVersionAsync(string inputVersion, CancellationToken ct = default);
@@ -43,6 +51,13 @@ public interface IAllocationService
     Task<AllocationVersion?> GetLatestAsync(CancellationToken ct = default);
 
     Task<AllocationExplanation?> ExplainAsync(int versionNumber, CancellationToken ct = default);
+
+    /// <summary>
+    /// Produce a traceable diff between two allocation versions: how their bound snapshots
+    /// differ (field level) and how their assignments changed (per task). Returns null when
+    /// either version does not exist.
+    /// </summary>
+    Task<VersionDiff?> DiffVersionsAsync(int versionNumber, int againstVersionNumber, CancellationToken ct = default);
 }
 
 /// <summary>A request to solve or replan, bound to a specific world snapshot.</summary>
@@ -125,4 +140,35 @@ public sealed record AllocationExplanation
     public required IReadOnlyList<Assignment> Assignments { get; init; }
     public required IReadOnlyList<UnassignedReason> Unassigned { get; init; }
     public required IReadOnlyList<RoadEventRef> RoadEvents { get; init; }
+}
+
+/// <summary>
+/// A traceable diff between two allocation versions: the world change (snapshot field diff)
+/// plus how each task's assignment moved. Keeps the round-N plan auditable against round-(N-1).
+/// </summary>
+public sealed record VersionDiff
+{
+    public required int VersionNumber { get; init; }
+    public required int AgainstVersionNumber { get; init; }
+    public required string SnapshotVersion { get; init; }
+    public required string AgainstSnapshotVersion { get; init; }
+    public required SnapshotDiff SnapshotDiff { get; init; }
+    public required IReadOnlyList<AssignmentChange> AssignmentChanges { get; init; }
+    public required IReadOnlyList<RoadEventRef> RoadEvents { get; init; }
+}
+
+/// <summary>How one task's assignment changed between two versions.</summary>
+public sealed record AssignmentChange
+{
+    public required string TaskCode { get; init; }
+    /// <summary>Added | Removed | Changed | Unchanged.</summary>
+    public required string Kind { get; init; }
+    public string? BeforeTeamCode { get; init; }
+    public string? BeforeVehicleCode { get; init; }
+    public string? BeforeRoadCode { get; init; }
+    public int? BeforeArrivalMinutes { get; init; }
+    public string? AfterTeamCode { get; init; }
+    public string? AfterVehicleCode { get; init; }
+    public string? AfterRoadCode { get; init; }
+    public int? AfterArrivalMinutes { get; init; }
 }

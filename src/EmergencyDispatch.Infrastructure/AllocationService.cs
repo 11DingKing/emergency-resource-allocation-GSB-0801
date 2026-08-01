@@ -126,9 +126,13 @@ public sealed class AllocationService : IAllocationService
         }
 
         // Same input version, different snapshot: never replay the old plan. Diff the snapshot
-        // the stored plan was bound to against the current world so the caller sees what moved.
-        var stored = DeserializeStored(existing);
-        var diff = SnapshotService.Diff(stored, current);
+        // the CALLER submitted (their possibly-stale view) against the current world, so they
+        // see exactly what they missed. If we can reconstruct that submitted snapshot's content
+        // from a stored version with the same digest, use it; otherwise fall back to the stored
+        // plan's snapshot.
+        var requested = await TryResolveSnapshotByDigestAsync(request.SnapshotVersion, ct)
+            ?? DeserializeStored(existing);
+        var diff = SnapshotService.Diff(requested, current);
         var roadEvents = await LoadRoadEventsAsync(ct);
 
         _logger.LogInformation(
@@ -146,10 +150,23 @@ public sealed class AllocationService : IAllocationService
                 RoadEvents = roadEvents,
                 Message =
                     $"Input version '{request.InputVersion}' is already bound to snapshot " +
-                    $"'{existing.SnapshotVersion}'. The submitted snapshot '{request.SnapshotVersion}' differs; " +
-                    "the existing plan is not replayed. See the field-level diff and road events.",
+                    $"'{existing.SnapshotVersion}'. The submitted snapshot '{request.SnapshotVersion}' differs from the " +
+                    "current world; the existing plan is not replayed. See the field-level diff and road events.",
             },
         };
+    }
+
+    /// <summary>
+    /// Reconstruct a world snapshot's content by its digest from any stored allocation version
+    /// that was bound to it. Lets a conflict diff show the caller's submitted (possibly stale)
+    /// view against the current world. Returns null when no stored version carries that digest.
+    /// </summary>
+    private async Task<WorldSnapshot?> TryResolveSnapshotByDigestAsync(string snapshotVersion, CancellationToken ct)
+    {
+        var match = await _db.AllocationVersions
+            .AsNoTracking()
+            .FirstOrDefaultAsync(v => v.SnapshotVersion == snapshotVersion, ct);
+        return match is null ? null : DeserializeStored(match);
     }
 
     private async Task<AllocationResult> StaleRequestConflictAsync(
@@ -524,6 +541,83 @@ public sealed class AllocationService : IAllocationService
         await _db.SaveChangesAsync(ct);
         return true;
     }
+
+    public async Task<bool> MarkTaskExecutedAsync(string taskCode, CancellationToken ct = default)
+    {
+        var task = await _db.Tasks.FirstOrDefaultAsync(t => t.Code == taskCode, ct);
+        if (task is null) return false;
+
+        // Pin the task to the crew the latest plan assigned it, so it stays fixed on-site and
+        // is never moved by a later replan (non-preemption applies once executing).
+        var latest = await GetLatestAsync(ct);
+        var assignment = latest?.Assignments.FirstOrDefault(a => a.TaskCode == taskCode);
+        if (assignment is null) return false;
+
+        task.Status = Domain.TaskStatus.InProgress;
+        task.ExecutingTeamId = assignment.TeamId;
+        task.ExecutingVehicleId = assignment.VehicleId;
+        await _db.SaveChangesAsync(ct);
+        return true;
+    }
+
+    public async Task<VersionDiff?> DiffVersionsAsync(
+        int versionNumber, int againstVersionNumber, CancellationToken ct = default)
+    {
+        var current = await GetVersionAsync(versionNumber, ct);
+        var against = await GetVersionAsync(againstVersionNumber, ct);
+        if (current is null || against is null) return null;
+
+        // Snapshot field diff: how the world the newer plan was bound to differs from the older.
+        var currentSnap = DeserializeStored(current);
+        var againstSnap = DeserializeStored(against);
+        var snapshotDiff = SnapshotService.Diff(againstSnap, currentSnap);
+
+        // Per-task assignment change, ordered by task code for a stable, traceable diff.
+        var beforeByTask = against.Assignments.ToDictionary(a => a.TaskCode, StringComparer.Ordinal);
+        var afterByTask = current.Assignments.ToDictionary(a => a.TaskCode, StringComparer.Ordinal);
+        var changes = new List<AssignmentChange>();
+        foreach (var code in beforeByTask.Keys.Union(afterByTask.Keys).OrderBy(c => c, StringComparer.Ordinal))
+        {
+            beforeByTask.TryGetValue(code, out var b);
+            afterByTask.TryGetValue(code, out var a);
+
+            string kind;
+            if (b is null) kind = "Added";
+            else if (a is null) kind = "Removed";
+            else kind = SameAssignment(b, a) ? "Unchanged" : "Changed";
+
+            changes.Add(new AssignmentChange
+            {
+                TaskCode = code,
+                Kind = kind,
+                BeforeTeamCode = b?.TeamCode,
+                BeforeVehicleCode = b?.VehicleCode,
+                BeforeRoadCode = b?.RoadSegmentCode,
+                BeforeArrivalMinutes = b?.ArrivalMinutes,
+                AfterTeamCode = a?.TeamCode,
+                AfterVehicleCode = a?.VehicleCode,
+                AfterRoadCode = a?.RoadSegmentCode,
+                AfterArrivalMinutes = a?.ArrivalMinutes,
+            });
+        }
+
+        return new VersionDiff
+        {
+            VersionNumber = current.VersionNumber,
+            AgainstVersionNumber = against.VersionNumber,
+            SnapshotVersion = current.SnapshotVersion,
+            AgainstSnapshotVersion = against.SnapshotVersion,
+            SnapshotDiff = snapshotDiff,
+            AssignmentChanges = changes,
+            RoadEvents = await LoadRoadEventsAsync(ct),
+        };
+    }
+
+    private static bool SameAssignment(Assignment b, Assignment a) =>
+        string.Equals(b.TeamCode, a.TeamCode, StringComparison.Ordinal)
+        && string.Equals(b.VehicleCode, a.VehicleCode, StringComparison.Ordinal)
+        && string.Equals(b.RoadSegmentCode, a.RoadSegmentCode, StringComparison.Ordinal)
+        && b.ArrivalMinutes == a.ArrivalMinutes;
 
     private static bool IsUniqueViolation(DbUpdateException ex)
     {

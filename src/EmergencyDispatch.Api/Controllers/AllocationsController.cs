@@ -106,6 +106,19 @@ public sealed class AllocationsController : ControllerBase
         return explanation is null ? NotFound() : Ok(ExplanationDto.From(explanation));
     }
 
+    /// <summary>
+    /// Traceable diff of a version against an earlier one: the world change (snapshot field
+    /// diff) plus how each task's assignment moved. Keeps round-N auditable against round-(N-1).
+    /// </summary>
+    [HttpGet("{versionNumber:int}/diff/{againstVersionNumber:int}")]
+    [ProducesResponseType(typeof(VersionDiffDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Diff(int versionNumber, int againstVersionNumber, CancellationToken ct)
+    {
+        var diff = await _service.DiffVersionsAsync(versionNumber, againstVersionNumber, ct);
+        return diff is null ? NotFound() : Ok(VersionDiffDto.From(diff));
+    }
+
     private IActionResult Respond(AllocationResult result)
     {
         if (result.Conflict is { } conflict)
