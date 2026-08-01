@@ -22,6 +22,20 @@ public class AllocationVersion
     /// </summary>
     public string InputVersion { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Deterministic digest of the world snapshot (roads, tasks, teams, vehicles, routes)
+    /// this version was solved against. A repeated <see cref="InputVersion"/> is only a valid
+    /// idempotent replay when it carries the same <see cref="SnapshotVersion"/>; a mismatch is
+    /// a conflict, never a stale replay.
+    /// </summary>
+    public string SnapshotVersion { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Canonical JSON of the bound snapshot, retained so a later conflicting submit can be
+    /// diffed field-by-field against the plan that is already on record.
+    /// </summary>
+    public string SnapshotJson { get; set; } = string.Empty;
+
     public AllocationKind Kind { get; set; }
 
     /// <summary>Total plan cost in minutes (sum of arrival times of assigned tasks).</summary>

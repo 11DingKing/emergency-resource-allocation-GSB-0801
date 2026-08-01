@@ -3,6 +3,7 @@ using System;
 using EmergencyDispatch.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace EmergencyDispatch.Infrastructure.Migrations
 {
     [DbContext(typeof(DispatchDbContext))]
-    partial class DispatchDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260801115827_AddRoadEventsAndSnapshotBinding")]
+    partial class AddRoadEventsAndSnapshotBinding
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

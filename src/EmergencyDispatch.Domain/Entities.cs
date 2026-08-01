@@ -83,6 +83,28 @@ public class RoadSegment
 }
 
 /// <summary>
+/// An immutable, append-only record of a road status change (a "road cut" or reopen). Keyed
+/// by a stable client-supplied <see cref="EventId"/> so recording the same event twice is
+/// idempotent. Explanations and diffs reference the event id that last changed a road so an
+/// operator can trace why a route became unavailable.
+/// </summary>
+public class RoadEvent
+{
+    public Guid Id { get; set; }
+
+    /// <summary>Stable, client-supplied identifier, e.g. "road-r2-closed-01". Unique.</summary>
+    public string EventId { get; set; } = string.Empty;
+
+    /// <summary>Stable code of the affected road segment.</summary>
+    public string RoadCode { get; set; } = string.Empty;
+
+    /// <summary>True if the event closed the road; false if it reopened it.</summary>
+    public bool Closed { get; set; }
+
+    public DateTimeOffset RecordedAt { get; set; }
+}
+
+/// <summary>
 /// A candidate way to reach a task over a specific road segment, with a travel time in
 /// minutes. A route is usable only if its road is open and the vehicle fits the height limit.
 /// </summary>

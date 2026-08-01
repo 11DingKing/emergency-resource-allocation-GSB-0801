@@ -21,6 +21,40 @@ public static class Capabilities
 }
 
 /// <summary>
+/// Stable, ordered danger-level names for life-safety severity. Persisted and exposed as
+/// stable strings; internally each maps to a monotonic rank so the solver can compare
+/// escalation deterministically. A rise in rank is the sole trigger that may justify
+/// preempting an in-progress task.
+/// </summary>
+public static class DangerLevels
+{
+    public const string Routine = "routine";
+    public const string Elevated = "elevated";
+    public const string High = "high";
+    public const string Critical = "critical";
+
+    // Ordered from least to most severe; index + 1 is the rank stored on tasks.
+    private static readonly string[] Ordered = { Routine, Elevated, High, Critical };
+
+    /// <summary>Monotonic rank for a stable name (routine=1 … critical=4).</summary>
+    public static int Rank(string name)
+    {
+        var idx = Array.IndexOf(Ordered, name);
+        if (idx < 0) throw new ArgumentOutOfRangeException(nameof(name), name, "Unknown danger level.");
+        return idx + 1;
+    }
+
+    /// <summary>Stable name for a rank; clamps to the nearest defined level.</summary>
+    public static string Name(int rank)
+    {
+        var idx = Math.Clamp(rank - 1, 0, Ordered.Length - 1);
+        return Ordered[idx];
+    }
+
+    public static bool IsDefined(string name) => Array.IndexOf(Ordered, name) >= 0;
+}
+
+/// <summary>
 /// Stable reason codes explaining why a task could not be assigned. Emitted by the
 /// solver and persisted verbatim so the explanation API is byte-for-byte reproducible.
 /// </summary>

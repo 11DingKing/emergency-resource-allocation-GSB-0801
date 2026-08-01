@@ -15,8 +15,13 @@ using Microsoft.EntityFrameworkCore;
 public sealed class RoadsController : ControllerBase
 {
     private readonly DispatchDbContext _db;
+    private readonly IAllocationService _service;
 
-    public RoadsController(DispatchDbContext db) => _db = db;
+    public RoadsController(DispatchDbContext db, IAllocationService service)
+    {
+        _db = db;
+        _service = service;
+    }
 
     /// <summary>List all road segments and their current open/closed state.</summary>
     [HttpGet]
@@ -36,7 +41,37 @@ public sealed class RoadsController : ControllerBase
         return Ok(roads);
     }
 
-    /// <summary>Cut or reopen a road segment by its stable code.</summary>
+    /// <summary>
+    /// Record a road event (a cut or reopen) with a stable event id, applying it to the road
+    /// and returning the resulting snapshot digest. Idempotent on <c>eventId</c>. This is the
+    /// preferred way to disrupt a road because the event id is referenced by explanations,
+    /// reroute audits and conflict diffs.
+    /// </summary>
+    [HttpPost("events")]
+    [ProducesResponseType(typeof(RoadEventResultDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(RoadEventResultDto), StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> RecordEvent([FromBody] RoadEventRequestDto body, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(body.EventId) || string.IsNullOrWhiteSpace(body.RoadCode))
+        {
+            return BadRequest(new { error = "eventId and roadCode are required." });
+        }
+
+        try
+        {
+            var result = await _service.RecordRoadEventAsync(body.EventId, body.RoadCode, body.Closed, ct);
+            var dto = RoadEventResultDto.From(result);
+            return result.WasExisting ? Ok(dto) : StatusCode(StatusCodes.Status201Created, dto);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return NotFound(new { error = ex.Message });
+        }
+    }
+
+    /// <summary>Cut or reopen a road segment by its stable code (simple state change, no event id).</summary>
     [HttpPut("{code}/state")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]

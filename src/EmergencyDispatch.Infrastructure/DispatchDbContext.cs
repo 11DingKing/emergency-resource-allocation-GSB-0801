@@ -26,6 +26,7 @@ public class DispatchDbContext : DbContext
     public DbSet<UnassignedReason> UnassignedReasons => Set<UnassignedReason>();
     public DbSet<AuditEntry> AuditEntries => Set<AuditEntry>();
     public DbSet<AllocationBaseline> AllocationBaselines => Set<AllocationBaseline>();
+    public DbSet<RoadEvent> RoadEvents => Set<RoadEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -82,6 +83,7 @@ public class DispatchDbContext : DbContext
             e.HasIndex(x => x.InputVersion).IsUnique();
             e.HasIndex(x => x.VersionNumber).IsUnique();
             e.Property(x => x.InputVersion).IsRequired();
+            e.Property(x => x.SnapshotVersion).IsRequired();
             e.Property(x => x.Kind).HasConversion<string>();
             e.HasMany(x => x.Assignments).WithOne().HasForeignKey(a => a.AllocationVersionId)
                 .OnDelete(DeleteBehavior.Cascade);
@@ -100,6 +102,14 @@ public class DispatchDbContext : DbContext
         {
             e.HasKey(x => x.Id);
             e.HasIndex(x => new { x.AllocationVersionId, x.TaskId }).IsUnique();
+        });
+        modelBuilder.Entity<RoadEvent>(e =>
+        {
+            e.HasKey(x => x.Id);
+            // Recording the same road event twice is idempotent.
+            e.HasIndex(x => x.EventId).IsUnique();
+            e.Property(x => x.EventId).IsRequired();
+            e.Property(x => x.RoadCode).IsRequired();
         });
     }
 }

@@ -140,6 +140,8 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
                 state.AddAudit(task, RuleCodes.InitialAssignment,
                     $"Task {task.Code} assigned to team {best.TeamCode} with vehicle {best.VehicleCode} via road {best.RoadSegmentCode}, arriving in {best.ArrivalMinutes} min.");
             }
+
+            EmitRerouteAuditIfNeeded(state, task, best);
             return;
         }
 
@@ -151,6 +153,27 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
         }
 
         RecordUnassignedReason(state, task, capableTeams);
+    }
+
+    /// <summary>
+    /// If a task was routed over a road that is <em>not</em> its fastest option because a
+    /// faster road was closed by a recorded road event, emit a REROUTE_AFTER_ROAD_CUT audit
+    /// citing that event id. This ties the plan change back to the concrete disruption.
+    /// </summary>
+    private static void EmitRerouteAuditIfNeeded(SolveState state, TaskSnapshot task, Candidate chosen)
+    {
+        var closedFaster = state.RoutesForTask(task.Id)
+            .Where(t => !t.road.IsOpen && t.road.LastEventId is not null)
+            .Where(t => t.route.TravelMinutes < chosen.ArrivalMinutes)
+            .OrderBy(t => t.route.TravelMinutes)
+            .ThenBy(t => t.road.Code, StringComparer.Ordinal)
+            .FirstOrDefault();
+
+        if (closedFaster.road is null) return;
+
+        state.AddAudit(task, RuleCodes.RerouteAfterRoadCut,
+            $"Task {task.Code} rerouted onto road {chosen.RoadSegmentCode} ({chosen.ArrivalMinutes} min) because " +
+            $"faster road {closedFaster.road.Code} ({closedFaster.route.TravelMinutes} min) was closed by event {closedFaster.road.LastEventId}.");
     }
 
     /// <summary>

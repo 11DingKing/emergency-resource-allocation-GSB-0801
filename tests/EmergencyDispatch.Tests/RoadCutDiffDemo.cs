@@ -6,9 +6,10 @@ using EmergencyDispatch.Solver;
 using Xunit.Abstractions;
 
 /// <summary>
-/// Runs the real greedy solver against the seeded scenario before and after cutting the
-/// low-clearance road, and emits the assignment diff plus the rule behind each change. This
-/// both documents the scenario and guards the exact numbers referenced in the README.
+/// Runs the real greedy solver through the user scenario: record road event
+/// <c>road-r2-closed-01</c> closing R2, escalate T1 to <c>critical</c>, then replan as
+/// <c>r2-critical-v1</c>. Emits the before/after assignment diff plus the rule behind each
+/// change, and guards the exact numbers and audit codes referenced in the README.
 /// </summary>
 public class RoadCutDiffDemo
 {
@@ -17,50 +18,64 @@ public class RoadCutDiffDemo
     public RoadCutDiffDemo(ITestOutputHelper output) => _out = output;
 
     [Fact]
-    public async Task Prints_before_and_after_road_cut_diff()
+    public async Task Prints_before_and_after_road_event_diff()
     {
         await using var db = await SqliteTestDatabase.CreateAsync();
         var solver = new GreedyAllocationSolver();
 
-        // BEFORE the cut.
-        var before = await Solve(db, solver, "demo-before", replan: false);
+        // BEFORE: solve against the initial snapshot.
+        var snapBefore = await SnapshotVersionAsync(db);
+        var before = await Solve(db, solver, "before-r2", snapBefore, replan: false);
 
-        // Cut R-LOW.
-        await using (var ctx = db.NewContext())
-        {
-            var road = ctx.RoadSegments.Single(r => r.Code == "R-LOW");
-            road.IsOpen = false;
-            await ctx.SaveChangesAsync();
-        }
+        // Record road event road-r2-closed-01 closing R2, then escalate T1 to critical.
+        await Service(db, solver).RecordRoadEventAsync("road-r2-closed-01", "R2", closed: true);
+        await Service(db, solver).SetTaskDangerAsync("T1", DangerLevels.Critical);
 
-        // AFTER the cut (replan permitted, though no escalation occurs here).
-        var after = await Solve(db, solver, "demo-after", replan: true);
+        // AFTER: replan against the new snapshot as r2-critical-v1.
+        var snapAfter = await SnapshotVersionAsync(db);
+        var after = await Solve(db, solver, "r2-critical-v1", snapAfter, replan: true);
 
-        _out.WriteLine("=== BEFORE ROAD CUT ===");
+        _out.WriteLine("=== BEFORE (snapshot " + snapBefore + ") ===");
         Dump(before);
-        _out.WriteLine("=== AFTER ROAD CUT (R-LOW closed) ===");
+        _out.WriteLine("=== AFTER road-r2-closed-01 + T1=critical (snapshot " + snapAfter + ") ===");
         Dump(after);
 
-        var beforeLife = before.Assignments.Single(a => a.TaskCode == "T-LIFE");
-        var afterLife = after.Assignments.Single(a => a.TaskCode == "T-LIFE");
-        Assert.Equal("R-LOW", beforeLife.RoadSegmentCode);
-        Assert.Equal(20, beforeLife.ArrivalMinutes);
-        Assert.Equal("R-HIGH", afterLife.RoadSegmentCode);
-        Assert.Equal(30, afterLife.ArrivalMinutes);
+        var beforeT1 = before.Assignments.Single(a => a.TaskCode == "T1");
+        var afterT1 = after.Assignments.Single(a => a.TaskCode == "T1");
+        Assert.Equal("R2", beforeT1.RoadSegmentCode);
+        Assert.Equal(20, beforeT1.ArrivalMinutes);
+        Assert.Equal("R1", afterT1.RoadSegmentCode);
+        Assert.Equal(30, afterT1.ArrivalMinutes);
+
+        // The reroute audit cites the road event; T2 stays held (non-preemption).
+        Assert.Contains(after.AuditEntries, e =>
+            e.RuleCode == RuleCodes.RerouteAfterRoadCut && e.TaskCode == "T1" && e.Message.Contains("road-r2-closed-01"));
+        Assert.Contains(after.AuditEntries, e =>
+            e.RuleCode == RuleCodes.NonPreemptionHeld && e.TaskCode == "T2");
+    }
+
+    private static AllocationService Service(SqliteTestDatabase db, IAllocationSolver solver) =>
+        new(db.NewContext(), solver, Microsoft.Extensions.Logging.Abstractions.NullLogger<AllocationService>.Instance);
+
+    private static async Task<string> SnapshotVersionAsync(SqliteTestDatabase db)
+    {
+        await using var ctx = db.NewContext();
+        var snap = await new SnapshotService(ctx).BuildAsync();
+        return snap.Version;
     }
 
     private static async Task<AllocationVersion> Solve(
-        SqliteTestDatabase db, IAllocationSolver solver, string inputVersion, bool replan)
+        SqliteTestDatabase db, IAllocationSolver solver, string inputVersion, string snapshotVersion, bool replan)
     {
-        await using var ctx = db.NewContext();
-        var svc = new AllocationService(ctx, solver, Microsoft.Extensions.Logging.Abstractions.NullLogger<AllocationService>.Instance);
-        var result = await svc.SolveAsync(new SolveRequest { InputVersion = inputVersion, IsReplan = replan });
-        return result.Version;
+        var result = await Service(db, solver).SolveAsync(
+            new SolveRequest { InputVersion = inputVersion, SnapshotVersion = snapshotVersion, IsReplan = replan });
+        Assert.False(result.IsConflict);
+        return result.Version!;
     }
 
     private void Dump(AllocationVersion v)
     {
-        _out.WriteLine($"version={v.VersionNumber} kind={v.Kind} cost={v.TotalCostMinutes}min");
+        _out.WriteLine($"version={v.VersionNumber} kind={v.Kind} cost={v.TotalCostMinutes}min snapshot={v.SnapshotVersion}");
         foreach (var a in v.Assignments.OrderBy(a => a.TaskCode, StringComparer.Ordinal))
         {
             _out.WriteLine($"  ASSIGN {a.TaskCode} -> team {a.TeamCode}, vehicle {a.VehicleCode}, road {a.RoadSegmentCode}, arrive {a.ArrivalMinutes}min");

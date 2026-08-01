@@ -60,6 +60,13 @@ public sealed record RoadSnapshot
     public required string Code { get; init; }
     public required decimal HeightLimitMeters { get; init; }
     public required bool IsOpen { get; init; }
+
+    /// <summary>
+    /// Stable id of the road event that last set this road's state (e.g. "road-r2-closed-01").
+    /// Null when no event has touched the road. The solver cites this in a reroute audit so
+    /// an operator can trace which event made a route unavailable.
+    /// </summary>
+    public string? LastEventId { get; init; }
 }
 
 public sealed record RouteSnapshot
