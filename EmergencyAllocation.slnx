@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EmergencyAllocation.Api/EmergencyAllocation.Api.csproj" />
+    <Project Path="src/EmergencyAllocation.Core/EmergencyAllocation.Core.csproj" />
+    <Project Path="src/EmergencyAllocation.Infrastructure/EmergencyAllocation.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/EmergencyAllocation.Tests/EmergencyAllocation.Tests.csproj" />
+  </Folder>
+</Solution>
