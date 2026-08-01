@@ -124,6 +124,77 @@ public class PgConcurrencyTests
     }
 
     [Fact]
+    public async Task 并发重开轮次_遗漏road_r2_open_02的旧快照必须冲突()
+    {
+        var options = await SetupAsync();
+        if (options is null) return;
+
+        Guid oldSnapshotId, newSnapshotId;
+        await using (var db = new DispatchDbContext(options))
+        {
+            var snapshots = new WorldSnapshotService(db);
+            var orch = new AllocationOrchestrator(db, new DeterministicAllocationSolver(), snapshots);
+
+            // 第 1 轮：初始求解
+            var s1 = await snapshots.CaptureAsync();
+            await orch.SolveAsync("day1-0800", PlanKind.Initial, null, s1.Id);
+
+            // 第 2 轮：R2 关闭 + T1 升级 → 重排（T1 → C）
+            var r2 = await db.RoadSegments.SingleAsync(r => r.Code == "R2");
+            r2.IsBlocked = true;
+            r2.LastEventId = "road-r2-closed-01";
+            var t1 = await db.Tasks.SingleAsync(t => t.Code == "T1");
+            t1.Danger = DangerLevel.Critical;
+            await db.SaveChangesAsync();
+            oldSnapshotId = (await snapshots.CaptureAsync()).Id;
+            await orch.SolveAsync("r2-critical-v1", PlanKind.Replan, "R2 中断", oldSnapshotId);
+
+            // 第 3 轮：road-r2-open-02 恢复 R2 + T1 已执行 → 新快照
+            r2.IsBlocked = false;
+            r2.LastEventId = "road-r2-open-02";
+            t1.Status = DispatchTaskStatus.InProgress;
+            await db.SaveChangesAsync();
+            newSnapshotId = (await snapshots.CaptureAsync()).Id;
+        }
+
+        // 并发：r2-reopened-v2，一个引用含 road-r2-open-02 的新快照，一个引用遗漏它的旧快照
+        var results = await Task.WhenAll(
+            Race(newSnapshotId),
+            Race(oldSnapshotId));
+
+        var success = Assert.Single(results, r => r.Outcome is not null);
+        var conflict = Assert.Single(results, r => r.Conflict is not null);
+
+        Assert.Equal(newSnapshotId, success.Outcome!.Plan.WorldSnapshotId); // 当前方案只能指向获胜快照
+        var t1Assignment = success.Outcome!.Plan.Assignments.Single(a => a.Task!.Code == "T1");
+        Assert.Equal("C", t1Assignment.Team!.Code);      // 已执行任务未被移动
+        Assert.Null(t1Assignment.RoadId);
+        Assert.Contains(conflict.Conflict!.Conflict, new[] { "stale_snapshot", "input_version_snapshot_conflict" });
+        Assert.Contains(conflict.Conflict!.Differences,
+            d => d.EntityType == "road" && d.Code == "R2" && d.Field == "isBlocked");
+
+        await using var verify = new DispatchDbContext(options);
+        Assert.Equal(1, await verify.Plans.CountAsync(p => p.InputVersion == "r2-reopened-v2"));
+        var committed = await verify.Plans.Include(p => p.WorldSnapshot)
+            .SingleAsync(p => p.Status == PlanStatus.Committed);
+        Assert.Equal(newSnapshotId, committed.WorldSnapshotId);
+
+        async Task<(SolveOutcome? Outcome, SolveConflictException? Conflict)> Race(Guid snapshotId)
+        {
+            try
+            {
+                await using var db = new DispatchDbContext(options);
+                var orch = new AllocationOrchestrator(db, new DeterministicAllocationSolver(), new WorldSnapshotService(db));
+                return (await orch.SolveAsync("r2-reopened-v2", PlanKind.Replan, "R2 恢复，T1 已执行", snapshotId), null);
+            }
+            catch (SolveConflictException ex)
+            {
+                return (null, ex);
+            }
+        }
+    }
+
+    [Fact]
     public async Task 求解前快照已过期_409且必须换新快照()
     {
         var options = await SetupAsync();

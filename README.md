@@ -50,6 +50,7 @@ dotnet run --project src/EmergencyDispatch.Api
 | POST | `/api/world/snapshots` | 捕获世界快照（道路/任务/队伍/车辆内容摘要，按摘要去重） |
 | GET | `/api/world/snapshots/{id}` | 快照详情（每实体 digest + 内容） |
 | POST | `/api/tasks/{code}/danger` | 危险等级 `{ "level": "standard\|elevated\|critical" }` |
+| POST | `/api/tasks/{code}/execution` | 执行状态 `{ "status": "in_progress\|completed" }`（幂等） |
 | POST | `/api/allocations/solve` | 初始求解 / 重排（幂等 + 快照绑定） |
 | GET | `/api/allocations/current` | 当前生效版本 |
 | GET | `/api/allocations/{id}` `/explanation` `/diff` | 方案详情 / 审计解释 / 版本差异 |
@@ -85,7 +86,7 @@ curl localhost:5080/api/allocations/{planId}/explanation
 
 - **求解器隔离**：`IAllocationSolver` 定义在 Domain，输入为不可变快照；控制器只做校验与 DTO 映射，算法不进控制器；测试注入同一确定性实现（`CountingSolver` 包装）。
 - **确定性**：输入先按编码排序；目标为全局 ETA 总和最小（分钟）；并列时按队伍编码字典序决胜（`tie_break_team_code` 记录进原因）。
-- **不可抢占**：执行中任务默认锁定；仅当 replan 且生命安全任务危险等级升至 critical，且存在具备全部所需能力的替代队伍时才允许抢占，并写入 `preemption_danger_escalation` 原因。
+- **不可抢占**：执行中任务默认锁定；仅当 replan 且生命安全任务危险等级升至 critical，且存在具备全部所需能力的替代队伍时才允许抢占，并写入 `preemption_danger_escalation` 原因。`in_progress` 任务绝不因道路恢复后 ETA 变短被移动或改道；`completed` 任务不再参与分配。
 - **快照绑定**：`POST /api/world/snapshots` 把道路/任务/队伍/车辆的内容规范化为逐实体 SHA-256 摘要并整体去重（内容寻址）。求解请求必须携带 `worldSnapshotId`；每份方案落库其采用的快照，diff/解释可给出两版快照的字段级差异并把道路通断归因到道路事件（`lastEventId`）。
 - **幂等与并发**：幂等键 = `inputVersion` + 世界快照。完全相同的请求 → 回放同一方案；同 `inputVersion` 配不同快照 → `409 input_version_snapshot_conflict`；引用已过期快照 → `409 stale_snapshot`；两者都带字段级差异，绝不把旧方案伪装成成功。`inputVersion` 与事件 `eventId` 均有唯一索引；提交在 RepeatableRead 事务内完成，唯一冲突 / 序列化失败 / xmin 乐观并发失败 → 回滚重试 → 幂等回放。方案+分配+任务状态+旧版本作废单事务提交，**半套分配对外不可见**；Infeasible 方案只落库审计，从不生效。
 - **一致性**：差异与解释 API 的规则文字直接读取求解时落库的 Reasons（jsonb），tie-break、不可分配原因、分配版本、世界快照、审计解释同源一致。

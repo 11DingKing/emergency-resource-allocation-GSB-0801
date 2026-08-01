@@ -45,4 +45,40 @@ public class TasksController(DispatchDbContext db) : ControllerBase
             task.DeadlineMinutes, task.DurationMinutes, task.Danger.ToString(), task.Status.ToString(),
             task.CurrentTeam?.Code));
     }
+
+    /// <summary>
+    /// 执行状态变更。in_progress：已出发执行（锁定给当前队伍，之后重排不因 ETA 变短被移动）；
+    /// completed：已完成（之后不再参与分配）。重复设置同一状态为幂等。
+    /// </summary>
+    [HttpPost("{code}/execution")]
+    [ProducesResponseType(typeof(TaskDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> SetExecution(string code, [FromBody] TaskExecutionDto dto, CancellationToken ct)
+    {
+        var target = dto.Status?.ToLowerInvariant() switch
+        {
+            "in_progress" => DispatchTaskStatus.InProgress,
+            "completed" => DispatchTaskStatus.Completed,
+            _ => (DispatchTaskStatus?)null
+        };
+        if (target is null)
+            return BadRequest(new ProblemDetails { Title = "请求不合法", Detail = "status 必须是 in_progress 或 completed。", Status = StatusCodes.Status400BadRequest });
+
+        var task = await db.Tasks.Include(t => t.CurrentTeam).FirstOrDefaultAsync(t => t.Code == code, ct);
+        if (task is null)
+            return NotFound(new ProblemDetails { Title = "未找到", Detail = $"任务 {code} 不存在。", Status = StatusCodes.Status404NotFound });
+
+        if (task.Status == DispatchTaskStatus.Completed)
+            return BadRequest(new ProblemDetails { Title = "请求不合法", Detail = $"任务 {code} 已完成，不能变更执行状态。", Status = StatusCodes.Status400BadRequest });
+
+        if (target == DispatchTaskStatus.InProgress && task.CurrentTeamId is null)
+            return BadRequest(new ProblemDetails { Title = "请求不合法", Detail = $"任务 {code} 尚未分配队伍，不能标记为执行中。", Status = StatusCodes.Status400BadRequest });
+
+        task.Status = target.Value;
+        await db.SaveChangesAsync(ct);
+        return Ok(new TaskDto(task.Id, task.Code, task.Title, task.Kind.ToString(), task.RequiredCapabilities,
+            task.DeadlineMinutes, task.DurationMinutes, task.Danger.ToString(), task.Status.ToString(),
+            task.CurrentTeam?.Code));
+    }
 }

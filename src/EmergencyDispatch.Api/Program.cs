@@ -13,7 +13,7 @@ builder.Services.AddOpenApi();
 builder.Services.AddDbContext<DispatchDbContext>(options =>
 {
     if (builder.Environment.IsEnvironment("Testing"))
-        options.UseInMemoryDatabase("dispatch-tests");
+        options.UseInMemoryDatabase(builder.Configuration["TestDbName"] ?? "dispatch-tests");
     else
         options.UseNpgsql(builder.Configuration.GetConnectionString("Dispatch"));
 });

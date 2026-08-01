@@ -20,6 +20,7 @@ public class ApiFlowTests : IClassFixture<ApiFlowTests.Factory>
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+            builder.UseSetting("TestDbName", Guid.NewGuid().ToString()); // 每个工厂独立 InMemory 库
         }
     }
 

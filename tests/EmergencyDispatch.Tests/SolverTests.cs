@@ -196,6 +196,70 @@ public class SolverTests
         Assert.Contains(result.Unassigned, u => u.TaskId == TaskT1);
     }
 
+    [Fact]
+    public void 已完成任务不参与分配()
+    {
+        var input = SeedLikeInput() with
+        {
+            Tasks =
+            [
+                Task(TaskT1, "T1", ["first_aid"], 35, DispatchTaskStatus.Completed, TeamA),
+                Task(TaskT2, "T2", ["slope_patrol"], null, DispatchTaskStatus.InProgress, TeamB, TaskKind.SlopeOperation),
+            ]
+        };
+        var result = _solver.Solve(input);
+
+        Assert.True(result.IsFeasible);
+        Assert.DoesNotContain(result.Assignments, a => a.TaskId == TaskT1);   // 已完成：不分配、不计原因
+        Assert.DoesNotContain(result.Unassigned, u => u.TaskId == TaskT1);
+        Assert.Single(result.Assignments, a => a.TaskId == TaskT2 && a.TeamId == TeamB);
+    }
+
+    [Fact]
+    public void 执行中任务不因ETA变短被移动()
+    {
+        // R2 恢复后 A/C 经 R2 都只需 30 分钟，但 T1 已由 C 出发执行：必须锁定，不改派也不改道
+        var input = SeedLikeInput() with
+        {
+            Tasks =
+            [
+                Task(TaskT1, "T1", ["first_aid"], 35, DispatchTaskStatus.InProgress, TeamC),
+                Task(TaskT2, "T2", ["slope_patrol"], null, DispatchTaskStatus.InProgress, TeamB, TaskKind.SlopeOperation),
+            ]
+        };
+        var result = _solver.Solve(input);
+
+        Assert.True(result.IsFeasible);
+        var t1 = Assert.Single(result.Assignments, a => a.TaskId == TaskT1);
+        Assert.Equal(TeamC, t1.TeamId);
+        Assert.Null(t1.RoadId);          // 已到达现场，不再上路
+        Assert.Equal(0, t1.EtaMinutes);
+        Assert.False(t1.IsPreemption);
+        Assert.Contains(t1.Reasons, r => r.Code == ReasonCodes.LockedInProgress);
+        Assert.Contains(result.Assignments, a => a.TaskId == TaskT2 && a.TeamId == TeamB);
+    }
+
+    [Fact]
+    public void 未标记执行的任务在道路恢复后可被重排() 
+    {
+        // 对照组：T1 若仍只是 Assigned（未执行），R2 恢复后允许按成本/tie-break 重排
+        var input = SeedLikeInput() with
+        {
+            Tasks =
+            [
+                Task(TaskT1, "T1", ["first_aid"], 35, DispatchTaskStatus.Assigned, TeamC),
+                Task(TaskT2, "T2", ["slope_patrol"], null, DispatchTaskStatus.InProgress, TeamB, TaskKind.SlopeOperation),
+            ]
+        };
+        var result = _solver.Solve(input);
+
+        Assert.True(result.IsFeasible);
+        var t1 = Assert.Single(result.Assignments, a => a.TaskId == TaskT1);
+        Assert.Equal(TeamA, t1.TeamId);   // A、C 经 R2 并列 30 分钟，tie-break 取 A
+        Assert.Equal(RoadR2, t1.RoadId);
+        Assert.Equal(30, t1.EtaMinutes);
+    }
+
     /// <summary>T1 只有 B 能到（R9 限高 2.8m），T2 可由 C 经 R10 接手。</summary>
     private static SolveInput OnlyBCanReachT1(bool allowPreemption) =>
         new(

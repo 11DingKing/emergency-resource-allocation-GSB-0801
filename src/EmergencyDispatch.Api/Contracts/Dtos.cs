@@ -71,6 +71,9 @@ public sealed record RoadUpdateDto(bool IsBlocked);
 
 public sealed record DangerUpdateDto(string Level, string? Reason);
 
+/// <summary>执行状态变更：in_progress（已出发执行）| completed（已完成）。</summary>
+public sealed record TaskExecutionDto(string Status);
+
 public static class PlanMapper
 {
     public static PlanDto ToDto(AllocationPlan p) => new(

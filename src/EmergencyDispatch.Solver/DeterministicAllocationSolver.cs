@@ -18,8 +18,9 @@ public sealed class DeterministicAllocationSolver : IAllocationSolver
         var roads = input.Roads.OrderBy(r => r.Code, StringComparer.Ordinal).ToArray();
         var allTasks = input.Tasks.OrderBy(t => t.Code, StringComparer.Ordinal).ToArray();
 
+        // 执行中任务锁定给原队伍（不因 ETA 变短被移动）；已完成任务不再参与分配
         var locked = allTasks.Where(t => t.Status == DispatchTaskStatus.InProgress).ToArray();
-        var open = allTasks.Where(t => t.Status != DispatchTaskStatus.InProgress).ToArray();
+        var open = allTasks.Where(t => t.Status is DispatchTaskStatus.Pending or DispatchTaskStatus.Assigned).ToArray();
 
         var attempt = SolveCore(teams, roads, open, locked, preemptionMode: false, input.Options);
         if (attempt.IsFeasible)
@@ -139,7 +140,7 @@ public sealed class DeterministicAllocationSolver : IAllocationSolver
             Dfs(0, 0);
 
         // 3) 无可行解：不输出任何分配（绝不产生半套分配），逐任务给出不可分配原因
-        if (optimal.Count == 0)
+        if (open.Length > 0 && optimal.Count == 0)
         {
             var unassigned = new List<UnassignedDecision>();
             foreach (var task in open)
@@ -172,11 +173,13 @@ public sealed class DeterministicAllocationSolver : IAllocationSolver
             return new SolveResult(false, Array.Empty<AssignmentDecision>(), unassigned, 0);
         }
 
-        // 4) 确定性 tie-break：最优向量集合中按队伍编码序列取字典序最小
+        // 4) 确定性 tie-break：最优向量集合中按队伍编码序列取字典序最小（空开放池 = 平凡可行）
         var teamCodeOf = teams.ToDictionary(t => t.Id, t => t.Code);
-        var selected = optimal
-            .OrderBy(v => string.Join("\u001f", v.Select(x => teamCodeOf[x.TeamId])), StringComparer.Ordinal)
-            .First();
+        var selected = open.Length == 0
+            ? Array.Empty<(Guid TeamId, Guid? RoadId, int Eta)>()
+            : optimal
+                .OrderBy(v => string.Join("\u001f", v.Select(x => teamCodeOf[x.TeamId])), StringComparer.Ordinal)
+                .First();
         var totalCost = selected.Sum(x => x.Eta);
 
         for (var i = 0; i < open.Length; i++)
