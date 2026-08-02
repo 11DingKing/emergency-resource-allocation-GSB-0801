@@ -14,6 +14,8 @@ public interface IAllocationService
     Task<AllocationResult?> GetByInputVersionAsync(string inputVersion, CancellationToken cancellationToken = default);
 
     Task<AllocationResult?> GetLatestCommittedAsync(CancellationToken cancellationToken = default);
+
+    Task<VersionDiffDto?> GetDiffAsync(Guid toVersionId, Guid fromVersionId, CancellationToken cancellationToken = default);
 }
 
 public interface IAdministrativeDataService

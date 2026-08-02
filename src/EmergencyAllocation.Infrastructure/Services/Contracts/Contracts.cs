@@ -87,3 +87,35 @@ public sealed record AllocationResult(
     Guid? PreviousVersionId,
     IReadOnlyList<AssignmentDto> Assignments,
     IReadOnlyList<ExplanationDto> Explanations);
+
+public sealed record AssignmentChangeDto(
+    string TaskId,
+    string? FromTeamId,
+    string? ToTeamId,
+    IReadOnlyList<string>? FromRoute,
+    IReadOnlyList<string>? ToRoute,
+    int FromArrivalMinutes,
+    int ToArrivalMinutes,
+    string FromKind,
+    string ToKind,
+    string ChangeType,
+    string? PreemptionReason);
+
+public sealed record SnapshotFieldChangeDto(
+    string Field,
+    string? FromHash,
+    string? ToHash,
+    bool Changed);
+
+public sealed record VersionDiffDto(
+    Guid FromVersionId,
+    string FromInputVersion,
+    Guid ToVersionId,
+    string ToInputVersion,
+    long FromCost,
+    long ToCost,
+    long CostDelta,
+    IReadOnlyList<AssignmentChangeDto> AssignmentChanges,
+    IReadOnlyList<SnapshotFieldChangeDto> SnapshotChanges,
+    string? TriggeringRoadEventId,
+    IReadOnlyList<string> ChangeReasons);

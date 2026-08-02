@@ -87,6 +87,155 @@ public sealed class AllocationService : IAllocationService
         return version is null ? null : Map(version);
     }
 
+    public async Task<VersionDiffDto?> GetDiffAsync(Guid toVersionId, Guid fromVersionId, CancellationToken cancellationToken = default)
+    {
+        var to = await GetVersionAsync(toVersionId, cancellationToken);
+        var from = await GetVersionAsync(fromVersionId, cancellationToken);
+        if (to is null || from is null)
+        {
+            return null;
+        }
+
+        var assignmentChanges = BuildAssignmentChanges(from, to);
+        var snapshotChanges = BuildSnapshotChanges(from, to);
+        var reasons = BuildChangeReasons(from, to, assignmentChanges);
+
+        return new VersionDiffDto(
+            from.VersionId,
+            from.InputVersion,
+            to.VersionId,
+            to.InputVersion,
+            from.TotalCost,
+            to.TotalCost,
+            to.TotalCost - from.TotalCost,
+            assignmentChanges,
+            snapshotChanges,
+            to.TriggeringRoadEventId,
+            reasons);
+    }
+
+    private static IReadOnlyList<AssignmentChangeDto> BuildAssignmentChanges(AllocationResult from, AllocationResult to)
+    {
+        var changes = new List<AssignmentChangeDto>();
+        var fromByTask = from.Assignments.ToDictionary(a => a.TaskId);
+        var toByTask = to.Assignments.ToDictionary(a => a.TaskId);
+        var allTaskIds = fromByTask.Keys.Concat(toByTask.Keys).Distinct().OrderBy(t => t, StringComparer.Ordinal);
+
+        foreach (var taskId in allTaskIds)
+        {
+            fromByTask.TryGetValue(taskId, out var f);
+            toByTask.TryGetValue(taskId, out var t);
+
+            var fromTeam = f?.TeamId;
+            var toTeam = t?.TeamId;
+            var teamChanged = !string.Equals(fromTeam, toTeam, StringComparison.Ordinal);
+            var fromRoute = f?.RouteNodes;
+            var toRoute = t?.RouteNodes;
+            var routeChanged = !(fromRoute is not null && toRoute is not null && fromRoute.SequenceEqual(toRoute));
+            var arrivalChanged = (f?.EstimatedArrivalMinutes ?? 0) != (t?.EstimatedArrivalMinutes ?? 0);
+            var kindChanged = !string.Equals(f?.Kind, t?.Kind, StringComparison.Ordinal);
+
+            var changeType = (f, t) switch
+            {
+                (null, not null) => "added",
+                (not null, null) => "removed",
+                _ when teamChanged => "team_changed",
+                _ when routeChanged || arrivalChanged => "route_changed",
+                _ when kindChanged => "kind_changed",
+                _ => "unchanged"
+            };
+
+            if (changeType == "unchanged")
+            {
+                continue;
+            }
+
+            changes.Add(new AssignmentChangeDto(
+                taskId,
+                fromTeam,
+                toTeam,
+                fromRoute,
+                toRoute,
+                f?.EstimatedArrivalMinutes ?? 0,
+                t?.EstimatedArrivalMinutes ?? 0,
+                f?.Kind ?? "Unassigned",
+                t?.Kind ?? "Unassigned",
+                changeType,
+                t?.PreemptionReason));
+        }
+
+        return changes;
+    }
+
+    private static IReadOnlyList<SnapshotFieldChangeDto> BuildSnapshotChanges(AllocationResult from, AllocationResult to)
+    {
+        var fields = new (string Field, string? From, string? To)[]
+        {
+            ("roads", from.SnapshotHashes.Roads, to.SnapshotHashes.Roads),
+            ("tasks", from.SnapshotHashes.Tasks, to.SnapshotHashes.Tasks),
+            ("teams", from.SnapshotHashes.Teams, to.SnapshotHashes.Teams),
+            ("vehicles", from.SnapshotHashes.Vehicles, to.SnapshotHashes.Vehicles)
+        };
+
+        return fields
+            .Select(f => new SnapshotFieldChangeDto(f.Field, f.From, f.To,
+                !string.Equals(f.From, f.To, StringComparison.Ordinal)))
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> BuildChangeReasons(
+        AllocationResult from,
+        AllocationResult to,
+        IReadOnlyList<AssignmentChangeDto> changes)
+    {
+        var reasons = new List<string>();
+
+        if (!string.IsNullOrEmpty(to.TriggeringRoadEventId) &&
+            !string.Equals(from.TriggeringRoadEventId, to.TriggeringRoadEventId, StringComparison.Ordinal))
+        {
+            reasons.Add($"触发道路事件: {to.TriggeringRoadEventId}");
+        }
+
+        var roadChanged = from.SnapshotHashes.Roads != to.SnapshotHashes.Roads;
+        if (roadChanged)
+        {
+            reasons.Add("道路快照发生变化（路段中断或恢复）");
+        }
+
+        var taskChanged = from.SnapshotHashes.Tasks != to.SnapshotHashes.Tasks;
+        if (taskChanged)
+        {
+            reasons.Add("任务快照发生变化（状态、危险等级或指派变更）");
+        }
+
+        foreach (var change in changes)
+        {
+            if (change.ChangeType == "team_changed" && change.PreemptionReason is not null)
+            {
+                reasons.Add($"任务 {change.TaskId}: {change.FromTeamId} → {change.ToTeamId}（{change.PreemptionReason}）");
+            }
+            else if (change.ChangeType == "team_changed")
+            {
+                reasons.Add($"任务 {change.TaskId}: 队伍由 {change.FromTeamId ?? "未分配"} 变更为 {change.ToTeamId ?? "未分配"}");
+            }
+            else if (change.ChangeType == "route_changed" && change.ToArrivalMinutes < change.FromArrivalMinutes)
+            {
+                reasons.Add($"任务 {change.TaskId}: 到达时间由 {change.FromArrivalMinutes} 分钟缩短至 {change.ToArrivalMinutes} 分钟（已执行任务未因 ETA 变短而移动）");
+            }
+            else if (change.ChangeType == "route_changed")
+            {
+                reasons.Add($"任务 {change.TaskId}: 路线由 {string.Join("→", change.FromRoute ?? Array.Empty<string>())} 变为 {string.Join("→", change.ToRoute ?? Array.Empty<string>())}");
+            }
+        }
+
+        if (to.TotalCost != from.TotalCost)
+        {
+            reasons.Add($"总成本变化: {from.TotalCost} → {to.TotalCost}（Δ {to.TotalCost - from.TotalCost}）");
+        }
+
+        return reasons;
+    }
+
     private async Task<AllocationResult> SolveWithIdempotencyAsync(
         string inputVersion,
         Guid? previousVersionId,

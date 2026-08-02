@@ -32,6 +32,11 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
             .Where(t => t.Status == TaskStatus.InProgress && t.AssignedTeamId is not null)
             .ToList();
 
+        var completedTasks = tasks
+            .Where(t => t.Status == TaskStatus.Completed && t.AssignedTeamId is not null)
+            .OrderBy(t => t.Id, StringComparer.Ordinal)
+            .ToList();
+
         if (!string.IsNullOrEmpty(problem.TriggeringRoadEventId))
         {
             var affectedRoad = problem.Roads.FirstOrDefault(r =>
@@ -50,6 +55,16 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
                 null));
         }
 
+        foreach (var completed in completedTasks)
+        {
+            ruleExplanations.Add(new SolverExplanation(
+                ExplanationKind.Rule,
+                RuleCodes.NonPreemptive,
+                $"任务 {completed.Id} 已执行完毕（队伍 {completed.AssignedTeamId}），不因道路恢复或 ETA 缩短而移动。",
+                completed.Id,
+                completed.AssignedTeamId));
+        }
+
         var preemptable = DeterminePreemptableTasks(problem, teams, inProgress, ruleExplanations);
         var combinations = EnumeratePreemptionCombinations(inProgress, preemptable);
 
@@ -59,7 +74,7 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
         foreach (var combination in combinations)
         {
             var candidateExplanations = new List<SolverExplanation>();
-            var feasible = TryEvaluateCombination(problem, teams, tasks, inProgress, combination, candidateExplanations,
+            var feasible = TryEvaluateCombination(problem, teams, tasks, inProgress, completedTasks, combination, candidateExplanations,
                 out var solution);
             MergeExplanations(diagnosticExplanations, candidateExplanations);
             if (feasible && solution is not null)
@@ -199,6 +214,7 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
         List<TeamState> teams,
         List<TaskState> tasks,
         List<TaskState> inProgress,
+        List<TaskState> completedTasks,
         HashSet<string> preemptedTaskIds,
         List<SolverExplanation> explanations,
         out Solution solution)
@@ -207,6 +223,24 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
         var decisions = new List<AssignmentDecision>();
         var usedTeams = new HashSet<string>();
         long cost = 0;
+
+        foreach (var task in completedTasks)
+        {
+            var teamId = task.AssignedTeamId!;
+            var team = teams.First(t => t.Id == teamId);
+            var route = RoutePlanner.FindRoute(problem.Roads, team.VehicleHeightMeters, team.CurrentNode,
+                task.LocationNode);
+            decisions.Add(new AssignmentDecision(
+                task.Id,
+                teamId,
+                team.VehicleId,
+                route.IsFeasible ? route.Nodes : Array.Empty<string>(),
+                route.IsFeasible ? route.TravelTimeMinutes : 0,
+                route.IsFeasible ? route.TravelTimeMinutes + task.DurationMinutes : task.DurationMinutes,
+                AssignmentKind.Kept,
+                null,
+                0));
+        }
 
         foreach (var task in inProgress)
         {

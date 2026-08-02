@@ -209,6 +209,258 @@ public class SnapshotAndCriticalTests
         Assert.Equal("INPUT_VERSION_SNAPSHOT_CONFLICT", ex.Response.ConflictType);
     }
 
+    [Fact]
+    public async Task RoadReopenEvent_RestoresR2AndChangesRoadHash()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var initial = await service.SolveInitialAsync(new InitialSolveRequest("reopen-v0"));
+        var initialRoadHash = initial.SnapshotHashes.Roads;
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "塌方", "dc"));
+        var closed = await service.SolveInitialAsync(new InitialSolveRequest("reopen-v1-closed"));
+        Assert.NotEqual(initialRoadHash, closed.SnapshotHashes.Roads);
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "塌方清理完毕，R2恢复通行", "dc"));
+
+        await using var verify = factory.CreateDbContext();
+        Assert.True((await verify.RoadSegments.SingleAsync(r => r.Id == "R2")).IsOpen);
+        var events = await verify.RoadEvents.Where(e => e.RoadSegmentId == "R2").OrderBy(e => e.OccurredAt).ToListAsync();
+        Assert.Equal(2, events.Count);
+        Assert.False(events[0].IsOpen);
+        Assert.True(events[1].IsOpen);
+        Assert.Equal("road-r2-open-02", events[1].Id);
+
+        var reopened = await service.SolveInitialAsync(new InitialSolveRequest("reopen-v2-open"));
+        Assert.Equal(initialRoadHash, reopened.SnapshotHashes.Roads);
+    }
+
+    [Fact]
+    public async Task T1Completed_NotMovedWhenR2Reopens_EvenWithShorterEtaAvailable()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var v0 = await service.SolveInitialAsync(new InitialSolveRequest("completed-v0"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "暴雨塌方", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.InProgress, AssignedTeamId: "A", DangerLevel: DangerLevel.Critical));
+
+        var v1 = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-critical-v1", v0.VersionId, true, TriggeringRoadEventId: "road-r2-closed-01"));
+        var t1V1 = Assert.Single(v1.Assignments, a => a.TaskId == "T1");
+        Assert.Equal("C", t1V1.TeamId);
+        Assert.Equal("ReassignedTo", t1V1.Kind);
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "R2恢复通行", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "C", DangerLevel: DangerLevel.Critical, CurrentNode: TestSeed.Water));
+
+        var v2 = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-reopened-v2", v1.VersionId, false, TriggeringRoadEventId: "road-r2-open-02"));
+
+        Assert.True(v2.IsFeasible);
+        Assert.Equal("road-r2-open-02", v2.TriggeringRoadEventId);
+
+        var t1V2 = Assert.Single(v2.Assignments, a => a.TaskId == "T1");
+        Assert.Equal("C", t1V2.TeamId);
+        Assert.Equal("Kept", t1V2.Kind);
+        Assert.Null(t1V2.PreemptionReason);
+
+        var t2V2 = Assert.Single(v2.Assignments, a => a.TaskId == "T2");
+        Assert.Equal("B", t2V2.TeamId);
+        Assert.Equal("Kept", t2V2.Kind);
+
+        Assert.Contains(v2.Explanations, e =>
+            e.RuleCode == RuleCodes.NonPreemptive &&
+            e.RelatedTaskId == "T1" &&
+            e.Message.Contains("已执行完毕"));
+    }
+
+    [Fact]
+    public async Task StaleExpectedHash_MissingReopenEvent_Returns409()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var v0 = await service.SolveInitialAsync(new InitialSolveRequest("stale-reopen-v0"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "塌方", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.InProgress, AssignedTeamId: "A", DangerLevel: DangerLevel.Critical));
+        var v1 = await service.RearrangeAsync(new RearrangeRequest(
+            "stale-r2-v1", v0.VersionId, true, TriggeringRoadEventId: "road-r2-closed-01"));
+
+        var staleRoadHash = v1.SnapshotHashes.Roads;
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "R2恢复", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "C"));
+
+        var ex = await Assert.ThrowsAsync<SnapshotConflictException>(() =>
+            service.RearrangeAsync(new RearrangeRequest(
+                "r2-reopened-v2", v1.VersionId, false,
+                ExpectedRoadSnapshotHash: staleRoadHash,
+                TriggeringRoadEventId: "road-r2-open-02")));
+
+        Assert.Equal("EXPECTED_SNAPSHOT_MISMATCH", ex.Response.ConflictType);
+        Assert.Contains(ex.Response.FieldDiffs, d => d.Field == "roads");
+        var roadDiff = ex.Response.FieldDiffs.First(d => d.Field == "roads");
+        Assert.Equal(staleRoadHash, roadDiff.ExpectedHash);
+        Assert.NotEqual(staleRoadHash, roadDiff.ActualHash);
+    }
+
+    [Fact]
+    public async Task SameVersionOldSnapshotAfterReopen_Returns409WithEventDiff()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var v0 = await service.SolveInitialAsync(new InitialSolveRequest("old-snap-v0"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "塌方", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.InProgress, AssignedTeamId: "A", DangerLevel: DangerLevel.Critical));
+        var v1 = await service.RearrangeAsync(new RearrangeRequest(
+            "old-snap-v1", v0.VersionId, true, TriggeringRoadEventId: "road-r2-closed-01"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "R2恢复", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "C"));
+
+        var correct = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-reopened-v2", v1.VersionId, false, TriggeringRoadEventId: "road-r2-open-02"));
+        Assert.True(correct.IsFeasible);
+
+        await admin.UpdateTaskAsync("T2", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "B"));
+        var ex = await Assert.ThrowsAsync<SnapshotConflictException>(() =>
+            service.RearrangeAsync(new RearrangeRequest(
+                "r2-reopened-v2", correct.VersionId, false)));
+
+        Assert.Equal("INPUT_VERSION_SNAPSHOT_CONFLICT", ex.Response.ConflictType);
+        Assert.NotNull(ex.Response.CommittedHashes);
+        Assert.NotEqual(ex.Response.CommittedHashes!.Combined, ex.Response.CurrentHashes.Combined);
+        Assert.Contains(ex.Response.FieldDiffs, d => d.Field == "tasks");
+    }
+
+    [Fact]
+    public async Task Round2ToRound3_DiffIsTraceable_ContainsAssignmentAndSnapshotChanges()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var v0 = await service.SolveInitialAsync(new InitialSolveRequest("diff-v0"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "暴雨塌方", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.InProgress, AssignedTeamId: "A", DangerLevel: DangerLevel.Critical));
+        var v1 = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-critical-v1", v0.VersionId, true, TriggeringRoadEventId: "road-r2-closed-01"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "塌方清理完毕", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "C", DangerLevel: DangerLevel.Critical, CurrentNode: TestSeed.Water));
+        var v2 = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-reopened-v2", v1.VersionId, false, TriggeringRoadEventId: "road-r2-open-02"));
+
+        var diff = await service.GetDiffAsync(v2.VersionId, v1.VersionId, CancellationToken.None);
+        Assert.NotNull(diff);
+
+        Assert.Equal(v1.VersionId, diff!.FromVersionId);
+        Assert.Equal("r2-critical-v1", diff.FromInputVersion);
+        Assert.Equal(v2.VersionId, diff.ToVersionId);
+        Assert.Equal("r2-reopened-v2", diff.ToInputVersion);
+        Assert.Equal("road-r2-open-02", diff.TriggeringRoadEventId);
+
+        var roadChange = Assert.Single(diff.SnapshotChanges, s => s.Field == "roads");
+        Assert.True(roadChange.Changed);
+        Assert.NotEqual(roadChange.FromHash, roadChange.ToHash);
+
+        var taskChange = Assert.Single(diff.SnapshotChanges, s => s.Field == "tasks");
+        Assert.True(taskChange.Changed);
+
+        var t1Change = diff.AssignmentChanges.FirstOrDefault(c => c.TaskId == "T1");
+        Assert.NotNull(t1Change);
+        Assert.Equal("C", t1Change!.FromTeamId);
+        Assert.Equal("C", t1Change.ToTeamId);
+
+        Assert.Contains(diff.ChangeReasons, r => r.Contains("road-r2-open-02"));
+        Assert.Contains(diff.ChangeReasons, r => r.Contains("道路快照发生变化"));
+        Assert.Contains(diff.ChangeReasons, r => r.Contains("任务快照发生变化"));
+    }
+
+    [Fact]
+    public async Task CommittedVersion_PointsToWinningSnapshot_OnlyOneWinner()
+    {
+        var factory = NewFactory(Guid.NewGuid().ToString());
+        await using (var ctx = factory.CreateDbContext())
+        {
+            await SeedAsync(ctx);
+        }
+
+        var service = new AllocationService(factory, new DeterministicSchedulingSolver(), NullLogger<AllocationService>.Instance);
+        var admin = new AdministrativeDataService(factory, NullLogger<AdministrativeDataService>.Instance);
+
+        var v0 = await service.SolveInitialAsync(new InitialSolveRequest("winner-v0"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-closed-01", false, "塌方", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.InProgress, AssignedTeamId: "A", DangerLevel: DangerLevel.Critical));
+        var v1 = await service.RearrangeAsync(new RearrangeRequest(
+            "winner-v1", v0.VersionId, true, TriggeringRoadEventId: "road-r2-closed-01"));
+
+        await admin.RecordRoadEventAsync(new RoadEventRequest("road-r2-open-02", true, "R2恢复", "dc"));
+        await admin.UpdateTaskAsync("T1", new TaskStateUpdateRequest(
+            Status: TaskStatus.Completed, AssignedTeamId: "C"));
+
+        var winner = await service.RearrangeAsync(new RearrangeRequest(
+            "r2-reopened-v2", v1.VersionId, false, TriggeringRoadEventId: "road-r2-open-02"));
+
+        var latest = await service.GetLatestCommittedAsync(CancellationToken.None);
+        Assert.NotNull(latest);
+        Assert.Equal(winner.VersionId, latest!.VersionId);
+        Assert.Equal(winner.SnapshotHash, latest.SnapshotHash);
+        Assert.Equal(winner.SnapshotHashes.Combined, latest.SnapshotHashes.Combined);
+
+        var byInput = await service.GetByInputVersionAsync("r2-reopened-v2", CancellationToken.None);
+        Assert.NotNull(byInput);
+        Assert.Equal(winner.VersionId, byInput!.VersionId);
+        Assert.Equal(winner.SnapshotHashes.Roads, byInput.SnapshotHashes.Roads);
+    }
+
     private sealed class SignalingSolver : ISchedulingSolver
     {
         private readonly ISchedulingSolver _inner;

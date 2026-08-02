@@ -93,4 +93,17 @@ public class AllocationsController : ControllerBase
 
         return Ok(result.Explanations);
     }
+
+    [HttpGet("{versionId:guid}/diff")]
+    [ProducesResponseType(typeof(VersionDiffDto), StatusCodes.Status200OK)]
+    public async Task<IActionResult> Diff(Guid versionId, [FromQuery] Guid from, CancellationToken cancellationToken)
+    {
+        if (from == Guid.Empty)
+        {
+            return BadRequest("'from' query parameter (previous version ID) is required.");
+        }
+
+        var diff = await _allocationService.GetDiffAsync(versionId, from, cancellationToken);
+        return diff is null ? NotFound() : Ok(diff);
+    }
 }
