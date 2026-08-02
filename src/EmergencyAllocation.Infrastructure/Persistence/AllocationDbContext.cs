@@ -15,6 +15,7 @@ public class AllocationDbContext : DbContext
     public DbSet<EmergencyTask> Tasks => Set<EmergencyTask>();
     public DbSet<TaskCapabilityRequirement> TaskCapabilityRequirements => Set<TaskCapabilityRequirement>();
     public DbSet<RoadSegment> RoadSegments => Set<RoadSegment>();
+    public DbSet<RoadEvent> RoadEvents => Set<RoadEvent>();
     public DbSet<AllocationVersion> AllocationVersions => Set<AllocationVersion>();
     public DbSet<Assignment> Assignments => Set<Assignment>();
     public DbSet<AllocationAuditEntry> AllocationAuditEntries => Set<AllocationAuditEntry>();
@@ -127,6 +128,12 @@ public class AllocationDbContext : DbContext
             e.Property(x => x.CommittedAt).HasColumnName("committed_at");
             e.Property(x => x.RoadSnapshotVersion).HasColumnName("road_snapshot_version");
             e.Property(x => x.FailureReason).HasColumnName("failure_reason").HasMaxLength(1024);
+            e.Property(x => x.RoadDigest).HasColumnName("road_digest").HasMaxLength(64);
+            e.Property(x => x.TaskDigest).HasColumnName("task_digest").HasMaxLength(64);
+            e.Property(x => x.TeamDigest).HasColumnName("team_digest").HasMaxLength(64);
+            e.Property(x => x.VehicleDigest).HasColumnName("vehicle_digest").HasMaxLength(64);
+            e.Property(x => x.RequestPayloadDigest).HasColumnName("request_payload_digest").HasMaxLength(128);
+            e.Property(x => x.TriggeringRoadEventId).HasColumnName("triggering_road_event_id").HasMaxLength(64);
             e.Property(x => x.TotalCostMinutes).HasColumnName("total_cost_minutes");
             e.Property(x => x.AssignedCount).HasColumnName("assigned_count");
             e.Property(x => x.UnassignedCount).HasColumnName("unassigned_count");
@@ -170,8 +177,25 @@ public class AllocationDbContext : DbContext
             e.Property(x => x.TeamCode).HasColumnName("team_code").HasMaxLength(32);
             e.Property(x => x.VehicleCode).HasColumnName("vehicle_code").HasMaxLength(32);
             e.Property(x => x.RoadCode).HasColumnName("road_code").HasMaxLength(32);
+            e.Property(x => x.RoadEventId).HasColumnName("road_event_id").HasMaxLength(64);
             e.Property(x => x.Message).HasColumnName("message").HasMaxLength(2048);
             e.HasIndex(x => x.AllocationVersionId);
+        });
+
+        modelBuilder.Entity<RoadEvent>(e =>
+        {
+            e.ToTable("road_events");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).HasColumnName("id");
+            e.Property(x => x.EventId).HasColumnName("event_id").HasMaxLength(64);
+            e.Property(x => x.RoadCode).HasColumnName("road_code").HasMaxLength(32);
+            e.Property(x => x.Kind).HasColumnName("kind");
+            e.Property(x => x.Reason).HasColumnName("reason").HasMaxLength(256);
+            e.Property(x => x.RoadSnapshotVersionBefore).HasColumnName("snapshot_version_before");
+            e.Property(x => x.RoadSnapshotVersionAfter).HasColumnName("snapshot_version_after");
+            e.Property(x => x.OccurredAt).HasColumnName("occurred_at");
+            e.Property(x => x.RecordedBy).HasColumnName("recorded_by").HasMaxLength(128);
+            e.HasIndex(x => x.EventId).IsUnique();
         });
     }
 }

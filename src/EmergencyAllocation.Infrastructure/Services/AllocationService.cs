@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using EmergencyAllocation.Domain;
 using EmergencyAllocation.Domain.Dtos;
 using EmergencyAllocation.Domain.Services;
@@ -8,8 +9,6 @@ using Microsoft.Extensions.Logging;
 using Npgsql;
 using TaskStatus = EmergencyAllocation.Domain.TaskStatus;
 
-using System.Collections.Concurrent;
-
 namespace EmergencyAllocation.Infrastructure.Services;
 
 public sealed class AllocationService : IAllocationService
@@ -18,15 +17,18 @@ public sealed class AllocationService : IAllocationService
 
     private readonly IDbContextFactory<AllocationDbContext> _contextFactory;
     private readonly IAllocationSolver _solver;
+    private readonly ISnapshotDigestService _digests;
     private readonly ILogger<AllocationService> _logger;
 
     public AllocationService(
         IDbContextFactory<AllocationDbContext> contextFactory,
         IAllocationSolver solver,
+        ISnapshotDigestService digests,
         ILogger<AllocationService> logger)
     {
         _contextFactory = contextFactory;
         _solver = solver;
+        _digests = digests;
         _logger = logger;
     }
 
@@ -65,6 +67,8 @@ public sealed class AllocationService : IAllocationService
         string idempotencyKey,
         CancellationToken ct)
     {
+        var payloadDigest = _digests.ComputePayloadDigest(
+            operation, request.InputVersion, request.Reason, request.RoadEventId);
 
         for (int attempt = 0; attempt < 3; attempt++)
         {
@@ -80,14 +84,59 @@ public sealed class AllocationService : IAllocationService
                     .Where(v => v.Operation == operation && v.IdempotencyKey == idempotencyKey)
                     .FirstOrDefaultAsync(ct);
 
+                var (teams, vehicles, tasks, roads, currentDigests) = await LoadStateAsync(ctx, ct);
+
                 if (existing is not null && IsTerminal(existing.Status))
                 {
+                    var fieldDiffs = new List<FieldDiffDto>();
+                    if (!string.Equals(existing.RequestPayloadDigest, payloadDigest, StringComparison.OrdinalIgnoreCase))
+                    {
+                        fieldDiffs.Add(new FieldDiffDto("requestPayloadDigest",
+                            existing.RequestPayloadDigest, payloadDigest,
+                            "The request payload differs from the original call that produced this version."));
+                    }
+                    if (!string.IsNullOrEmpty(existing.RoadDigest)
+                        && !string.Equals(existing.RoadDigest, currentDigests.Road, StringComparison.OrdinalIgnoreCase))
+                    {
+                        fieldDiffs.Add(new FieldDiffDto("roadDigest",
+                            existing.RoadDigest, currentDigests.Road,
+                            "Road snapshot has changed since the version was produced."));
+                    }
+                    if (!string.IsNullOrEmpty(existing.TeamDigest)
+                        && !string.Equals(existing.TeamDigest, currentDigests.Team, StringComparison.OrdinalIgnoreCase))
+                    {
+                        fieldDiffs.Add(new FieldDiffDto("teamDigest",
+                            existing.TeamDigest, currentDigests.Team,
+                            "Team snapshot has changed since the version was produced."));
+                    }
+                    if (!string.IsNullOrEmpty(existing.VehicleDigest)
+                        && !string.Equals(existing.VehicleDigest, currentDigests.Vehicle, StringComparison.OrdinalIgnoreCase))
+                    {
+                        fieldDiffs.Add(new FieldDiffDto("vehicleDigest",
+                            existing.VehicleDigest, currentDigests.Vehicle,
+                            "Vehicle snapshot has changed since the version was produced."));
+                    }
+
+                    if (fieldDiffs.Count > 0)
+                    {
+                        await tx.RollbackAsync(ct);
+                        throw new SnapshotConflictException(new SnapshotConflictDto(
+                            idempotencyKey,
+                            existing.Status.ToString(),
+                            existing.RequestPayloadDigest ?? string.Empty,
+                            payloadDigest,
+                            fieldDiffs,
+                            $"Idempotency key {idempotencyKey} was already used against a different snapshot."));
+                    }
+
                     await tx.RollbackAsync(ct);
                     _logger.LogInformation(
-                        "Idempotent hit on {Operation} key={Key} version={VersionId} status={Status}",
-                        operation, idempotencyKey, existing.Id, existing.Status);
+                        "Idempotent replay on {Operation} key={Key} version={VersionId}",
+                        operation, idempotencyKey, existing.Id);
                     return await MapVersionAsync(existing.Id, ct);
                 }
+
+                ValidateExpectedDigests(request, currentDigests);
 
                 if (existing is not null && existing.Status == AllocationVersionStatus.Pending)
                 {
@@ -95,14 +144,11 @@ public sealed class AllocationService : IAllocationService
                     await ctx.SaveChangesAsync(ct);
                 }
 
-                var roadSnapshotVersion = await ctx.RoadSegments
-                    .MaxAsync(r => (long?)r.RoadSnapshotVersion, ct) ?? 0L;
-
-                var snapshot = await BuildSnapshotAsync(ctx, roadSnapshotVersion, ct);
+                var roadSnapshotVersion = currentDigests.RoadSnapshotVersion;
                 var solverRequest = new SolverRequest(
-                    snapshot.Teams,
-                    snapshot.Tasks,
-                    snapshot.Roads,
+                    ToSolverTeams(teams),
+                    ToSolverTasks(tasks),
+                    ToSolverRoads(roads),
                     roadSnapshotVersion,
                     operation,
                     allowReassign,
@@ -124,6 +170,12 @@ public sealed class AllocationService : IAllocationService
                         IdempotencyKey = idempotencyKey,
                         Status = AllocationVersionStatus.Failed,
                         RoadSnapshotVersion = roadSnapshotVersion,
+                        RoadDigest = currentDigests.Road,
+                        TaskDigest = currentDigests.Task,
+                        TeamDigest = currentDigests.Team,
+                        VehicleDigest = currentDigests.Vehicle,
+                        RequestPayloadDigest = payloadDigest,
+                        TriggeringRoadEventId = request.RoadEventId,
                         CreatedAt = DateTimeOffset.UtcNow,
                         FailureReason = Truncate(ex.Message, 1024)
                     };
@@ -143,6 +195,12 @@ public sealed class AllocationService : IAllocationService
                         ? AllocationVersionStatus.Committed
                         : AllocationVersionStatus.NoFeasibleSolution,
                     RoadSnapshotVersion = roadSnapshotVersion,
+                    RoadDigest = currentDigests.Road,
+                    TaskDigest = currentDigests.Task,
+                    TeamDigest = currentDigests.Team,
+                    VehicleDigest = currentDigests.Vehicle,
+                    RequestPayloadDigest = payloadDigest,
+                    TriggeringRoadEventId = request.RoadEventId,
                     CreatedAt = DateTimeOffset.UtcNow,
                     CommittedAt = result.Feasible ? DateTimeOffset.UtcNow : null,
                     TotalCostMinutes = result.TotalCostMinutes,
@@ -184,7 +242,21 @@ public sealed class AllocationService : IAllocationService
                         TeamCode = au.TeamCode,
                         VehicleCode = au.VehicleCode,
                         RoadCode = au.RoadCode,
+                        RoadEventId = request.RoadEventId,
                         Message = au.Message
+                    });
+                }
+
+                if (!string.IsNullOrEmpty(request.RoadEventId))
+                {
+                    version.AuditEntries.Add(new AllocationAuditEntry
+                    {
+                        Id = Guid.NewGuid(),
+                        Order = version.AuditEntries.Count + 1,
+                        Kind = "road-event",
+                        RoadCode = null,
+                        RoadEventId = request.RoadEventId,
+                        Message = $"Solve request explicitly references road event {request.RoadEventId}."
                     });
                 }
 
@@ -192,7 +264,6 @@ public sealed class AllocationService : IAllocationService
 
                 if (result.Feasible)
                 {
-                    var taskDict = snapshot.Tasks.ToDictionary(t => t.Id);
                     foreach (var a in result.Assignments
                                  .Where(x => x.Decision is AllocationDecision.Assigned
                                      or AllocationDecision.Reassigned))
@@ -250,6 +321,69 @@ public sealed class AllocationService : IAllocationService
             $"Failed to commit allocation for {operation} after retries (idempotency key={idempotencyKey}).");
     }
 
+    private void ValidateExpectedDigests(SolveRequestDto request, SnapshotDigests current)
+    {
+        var diffs = new List<FieldDiffDto>();
+        void Check(string field, string? expected, string actual)
+        {
+            if (!string.IsNullOrWhiteSpace(expected) &&
+                !string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
+            {
+                diffs.Add(new FieldDiffDto(field, expected, actual,
+                    $"Client expected {field}={expected} but current snapshot is {actual}."));
+            }
+        }
+
+        Check("roadDigest", request.ExpectedRoadDigest, current.Road);
+        Check("taskDigest", request.ExpectedTaskDigest, current.Task);
+        Check("teamDigest", request.ExpectedTeamDigest, current.Team);
+        Check("vehicleDigest", request.ExpectedVehicleDigest, current.Vehicle);
+        if (request.ExpectedRoadSnapshotVersion.HasValue
+            && request.ExpectedRoadSnapshotVersion.Value != current.RoadSnapshotVersion)
+        {
+            diffs.Add(new FieldDiffDto("roadSnapshotVersion",
+                request.ExpectedRoadSnapshotVersion.Value.ToString(),
+                current.RoadSnapshotVersion.ToString(),
+                "Road snapshot version differs from the value asserted by the caller."));
+        }
+
+        if (diffs.Count > 0)
+        {
+            throw new SnapshotConflictException(new SnapshotConflictDto(
+                string.Empty, "Current", string.Empty,
+                _digests.ComputePayloadDigest("expected", request.InputVersion, request.Reason, request.RoadEventId),
+                diffs,
+                "Request's expected digests do not match the current server snapshot."));
+        }
+    }
+
+    private static List<FieldDiffDto> BuildConflictDiffs(
+        AllocationVersion existing,
+        SnapshotDigests current,
+        string currentPayloadDigest,
+        SolveRequestDto request)
+    {
+        var diffs = new List<FieldDiffDto>();
+        void Add(string field, string? expected, string? actual, string detail)
+        {
+            if (!string.Equals(expected ?? string.Empty, actual ?? string.Empty, StringComparison.Ordinal))
+                diffs.Add(new FieldDiffDto(field, expected, actual, detail));
+        }
+
+        Add("requestPayloadDigest", existing.RequestPayloadDigest, currentPayloadDigest,
+            "The request payload differs from the original call that produced this version.");
+        Add("roadDigest", existing.RoadDigest, current.Road,
+            "Road snapshot has changed since the version was produced.");
+        Add("taskDigest", existing.TaskDigest, current.Task,
+            "Task snapshot has changed since the version was produced.");
+        Add("teamDigest", existing.TeamDigest, current.Team,
+            "Team snapshot has changed since the version was produced.");
+        Add("vehicleDigest", existing.VehicleDigest, current.Vehicle,
+            "Vehicle snapshot has changed since the version was produced.");
+
+        return diffs;
+    }
+
     public async Task<AllocationVersionDto?> GetVersionAsync(Guid versionId, CancellationToken ct = default)
         => await MapVersionAsync(versionId, ct);
 
@@ -263,14 +397,17 @@ public sealed class AllocationService : IAllocationService
         return v is null ? null : await MapVersionAsync(v.Id, ct);
     }
 
-    public async Task InterruptRoadAsync(RoadInterruptRequestDto request, CancellationToken ct = default)
-        => await ChangeRoadAsync(request.RoadCode, false, request.Reason ?? "Road interrupted", request.InputVersion, ct);
+    public Task<RoadEventDto> InterruptRoadAsync(RoadInterruptRequestDto request, CancellationToken ct = default)
+        => ChangeRoadAsync(request.RoadCode, false, request.Reason ?? "Road interrupted",
+            request.InputVersion, request.EventId ?? Guid.NewGuid().ToString("N"), request.RecordedBy, ct);
 
-    public async Task ReopenRoadAsync(RoadReopenRequestDto request, CancellationToken ct = default)
-        => await ChangeRoadAsync(request.RoadCode, true, request.Reason ?? "Road reopened", request.InputVersion, ct);
+    public Task<RoadEventDto> ReopenRoadAsync(RoadReopenRequestDto request, CancellationToken ct = default)
+        => ChangeRoadAsync(request.RoadCode, true, request.Reason ?? "Road reopened",
+            request.InputVersion, request.EventId ?? Guid.NewGuid().ToString("N"), request.RecordedBy, ct);
 
-    private async Task ChangeRoadAsync(
-        string roadCode, bool isOpen, string reason, string inputVersion, CancellationToken ct)
+    private async Task<RoadEventDto> ChangeRoadAsync(
+        string roadCode, bool isOpen, string reason, string inputVersion,
+        string eventId, string? recordedBy, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(inputVersion))
             throw new ArgumentException("InputVersion is required.", nameof(inputVersion));
@@ -283,10 +420,18 @@ public sealed class AllocationService : IAllocationService
 
             try
             {
+                var duplicate = await ctx.RoadEvents.FirstOrDefaultAsync(e => e.EventId == eventId, ct);
+                if (duplicate is not null)
+                {
+                    await tx.RollbackAsync(ct);
+                    return ToDto(duplicate);
+                }
+
                 var road = await ctx.RoadSegments.FirstOrDefaultAsync(r => r.Code == roadCode, ct);
                 if (road is null)
                     throw new KeyNotFoundException($"Road {roadCode} not found.");
 
+                var before = road.RoadSnapshotVersion;
                 road.IsOpen = isOpen;
                 road.InterruptionReason = isOpen ? null : reason;
                 road.UpdatedAt = DateTimeOffset.UtcNow;
@@ -294,9 +439,23 @@ public sealed class AllocationService : IAllocationService
                 var nextVersion = (await ctx.RoadSegments.MaxAsync(r => (long?)r.RoadSnapshotVersion, ct) ?? 0L) + 1;
                 road.RoadSnapshotVersion = nextVersion;
 
+                var evt = new RoadEvent
+                {
+                    Id = Guid.NewGuid(),
+                    EventId = eventId,
+                    RoadCode = roadCode,
+                    Kind = isOpen ? RoadEventKind.Reopen : RoadEventKind.Interruption,
+                    Reason = reason,
+                    RoadSnapshotVersionBefore = before,
+                    RoadSnapshotVersionAfter = nextVersion,
+                    OccurredAt = DateTimeOffset.UtcNow,
+                    RecordedBy = recordedBy
+                };
+                ctx.RoadEvents.Add(evt);
+
                 await ctx.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
-                return;
+                return ToDto(evt);
             }
             catch (DbUpdateException ex) when (IsTransient(ex) && attempt < 2)
             {
@@ -306,6 +465,99 @@ public sealed class AllocationService : IAllocationService
         }
         throw new InvalidOperationException("Failed to update road after retries.");
     }
+
+    public async Task<TaskDto> EscalateTaskAsync(TaskEscalationRequestDto request, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.InputVersion))
+            throw new ArgumentException("InputVersion is required.", nameof(request));
+        if (!Enum.TryParse<TaskSeverity>(request.TargetSeverity, ignoreCase: true, out var target))
+            throw new ArgumentException($"Unknown severity {request.TargetSeverity}", nameof(request));
+
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
+            await using var tx = await ctx.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.Serializable, ct);
+            try
+            {
+                var task = await ctx.Tasks.Include(t => t.RequiredCapabilities)
+                    .FirstOrDefaultAsync(t => t.Code == request.TaskCode, ct);
+                if (task is null) throw new KeyNotFoundException($"Task {request.TaskCode} not found.");
+
+                task.Severity = target;
+                task.SeverityVersion++;
+
+                await ctx.SaveChangesAsync(ct);
+                await tx.CommitAsync(ct);
+
+                return new TaskDto(
+                    task.Id, task.Code, task.Title, task.LocationNodeId,
+                    task.Severity.ToString(), task.Status.ToString(),
+                    task.DurationMinutes, task.DeadlineMinutes,
+                    task.SeverityVersion, task.AssignedTeamId, task.AssignedVehicleId,
+                    task.StartedAt,
+                    task.RequiredCapabilities.Select(c => c.Capability).OrderBy(x => x).ToList());
+            }
+            catch (DbUpdateException ex) when (IsTransient(ex) && attempt < 2)
+            {
+                await tx.RollbackAsync(ct);
+            }
+        }
+        throw new InvalidOperationException("Failed to escalate task after retries.");
+    }
+
+    public async Task<SnapshotDigestDto> GetCurrentDigestsAsync(CancellationToken ct = default)
+    {
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
+        var (_, _, _, _, digests) = await LoadStateAsync(ctx, ct);
+        return new SnapshotDigestDto(digests.RoadSnapshotVersion,
+            digests.Road, digests.Task, digests.Team, digests.Vehicle);
+    }
+
+    private async Task<(
+        IReadOnlyList<Team> Teams,
+        IReadOnlyList<Vehicle> Vehicles,
+        IReadOnlyList<EmergencyTask> Tasks,
+        IReadOnlyList<RoadSegment> Roads,
+        SnapshotDigests Digests)>
+        LoadStateAsync(AllocationDbContext ctx, CancellationToken ct)
+    {
+        var teams = await ctx.Teams.AsNoTracking().Include(t => t.Capabilities).Include(t => t.Vehicles).ToListAsync(ct);
+        var vehicles = teams.SelectMany(t => t.Vehicles).ToList();
+        var tasks = await ctx.Tasks.AsNoTracking().Include(t => t.RequiredCapabilities).ToListAsync(ct);
+        var allRoads = await ctx.RoadSegments.AsNoTracking().ToListAsync(ct);
+
+        var latestRoads = allRoads
+            .GroupBy(r => r.Code)
+            .Select(g => g.OrderByDescending(r => r.RoadSnapshotVersion).First())
+            .ToList();
+
+        var digests = _digests.Compute(teams, tasks, latestRoads, vehicles);
+        return (teams, vehicles, tasks, latestRoads, digests);
+    }
+
+    private static IReadOnlyList<SolverTeam> ToSolverTeams(IEnumerable<Team> teams) => teams
+        .Select(t => new SolverTeam(
+            t.Id, t.Code, t.BaseNodeId, t.IsAvailable,
+            t.Capabilities.Select(c => c.Capability).ToHashSet(StringComparer.Ordinal),
+            t.Vehicles.Select(v => new SolverVehicle(
+                v.Id, v.Code, v.TeamId, v.HeightMeters, v.AverageSpeedMetersPerMinute, v.IsAvailable)).ToList()))
+        .ToList();
+
+    private static IReadOnlyList<SolverTask> ToSolverTasks(IEnumerable<EmergencyTask> tasks) => tasks
+        .Select(t => new SolverTask(
+            t.Id, t.Code, t.Title, t.LocationNodeId, t.Severity, t.SeverityVersion, t.Status,
+            t.DurationMinutes, t.DeadlineMinutes,
+            t.RequiredCapabilities.Select(r => r.Capability).ToHashSet(StringComparer.Ordinal),
+            t.AssignedTeamId, t.AssignedVehicleId,
+            t.Status == TaskStatus.InProgress && t.StartedAt.HasValue))
+        .ToList();
+
+    private static IReadOnlyList<SolverRoad> ToSolverRoads(IEnumerable<RoadSegment> roads) => roads
+        .Select(r => new SolverRoad(
+            r.Code, r.FromNodeId, r.ToNodeId, r.TravelTimeMinutes,
+            r.HeightLimitMeters, r.IsOpen, r.RoadSnapshotVersion))
+        .ToList();
 
     private static bool IsTerminal(AllocationVersionStatus s) =>
         s is AllocationVersionStatus.Committed
@@ -339,24 +591,23 @@ public sealed class AllocationService : IAllocationService
             .FirstOrDefaultAsync(x => x.Id == versionId, ct);
 
         if (v is null) throw new KeyNotFoundException($"Allocation version {versionId} not found.");
-        return ToDto(v);
+
+        SnapshotDigestDto? current = null;
+        try
+        {
+            var (teams, vehicles, tasks, roads, digests) = await LoadStateAsync(ctx, ct);
+            current = new SnapshotDigestDto(digests.RoadSnapshotVersion,
+                digests.Road, digests.Task, digests.Team, digests.Vehicle);
+        }
+        catch
+        {
+            current = null;
+        }
+
+        return ToDto(v, current);
     }
 
-    private async Task<AllocationVersionDto?> MapLatestAsync(CancellationToken ct)
-    {
-        await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
-        var v = await ctx.AllocationVersions
-            .AsNoTracking()
-            .Include(x => x.Assignments).ThenInclude(a => a.Task)
-            .Include(x => x.Assignments).ThenInclude(a => a.Team)
-            .Include(x => x.Assignments).ThenInclude(a => a.Vehicle)
-            .Include(x => x.AuditEntries)
-            .OrderByDescending(x => x.Sequence)
-            .FirstOrDefaultAsync(ct);
-        return v is null ? null : ToDto(v);
-    }
-
-    private static AllocationVersionDto ToDto(AllocationVersion v) => new(
+    private static AllocationVersionDto ToDto(AllocationVersion v, SnapshotDigestDto? current = null) => new(
         v.Id,
         v.Operation,
         v.InputVersion,
@@ -366,10 +617,17 @@ public sealed class AllocationService : IAllocationService
         v.CreatedAt,
         v.CommittedAt,
         v.RoadSnapshotVersion,
+        v.RoadDigest,
+        v.TaskDigest,
+        v.TeamDigest,
+        v.VehicleDigest,
+        v.RequestPayloadDigest,
+        v.TriggeringRoadEventId,
         v.TotalCostMinutes,
         v.AssignedCount,
         v.UnassignedCount,
         v.FailureReason,
+        current,
         v.Assignments
             .OrderBy(a => a.Task?.Code ?? string.Empty, StringComparer.Ordinal)
             .Select(a => new AssignmentDto(
@@ -391,54 +649,10 @@ public sealed class AllocationService : IAllocationService
                 a.PreviousVehicleId))
             .ToList(),
         v.AuditEntries.OrderBy(a => a.Order).Select(a => new AuditEntryDto(
-            a.Order, a.Kind, a.TaskCode, a.TeamCode, a.VehicleCode, a.RoadCode, a.Message)).ToList());
+            a.Order, a.Kind, a.TaskCode, a.TeamCode, a.VehicleCode, a.RoadCode, a.RoadEventId, a.Message)).ToList());
 
-    private static async Task<SolverSnapshot> BuildSnapshotAsync(
-        AllocationDbContext ctx, long snapshotVersion, CancellationToken ct)
-    {
-        var teams = await ctx.Teams
-            .AsNoTracking()
-            .Include(t => t.Capabilities)
-            .Include(t => t.Vehicles)
-            .ToListAsync(ct);
-
-        var tasks = await ctx.Tasks
-            .AsNoTracking()
-            .Include(t => t.RequiredCapabilities)
-            .ToListAsync(ct);
-
-        var roads = await ctx.RoadSegments
-            .AsNoTracking()
-            .Where(r => r.RoadSnapshotVersion <= snapshotVersion || r.RoadSnapshotVersion == 0)
-            .ToListAsync(ct);
-
-        var latestByCode = roads
-            .GroupBy(r => r.Code)
-            .Select(g => g.OrderByDescending(r => r.RoadSnapshotVersion).First())
-            .ToList();
-
-        var solverTeams = teams.Select(t => new SolverTeam(
-            t.Id, t.Code, t.BaseNodeId, t.IsAvailable,
-            t.Capabilities.Select(c => c.Capability).ToHashSet(StringComparer.Ordinal),
-            t.Vehicles.Select(v => new SolverVehicle(
-                v.Id, v.Code, v.TeamId, v.HeightMeters, v.AverageSpeedMetersPerMinute, v.IsAvailable)).ToList())).ToList();
-
-        var solverTasks = tasks.Select(t => new SolverTask(
-            t.Id, t.Code, t.Title, t.LocationNodeId, t.Severity, t.SeverityVersion, t.Status,
-            t.DurationMinutes, t.DeadlineMinutes,
-            t.RequiredCapabilities.Select(r => r.Capability).ToHashSet(StringComparer.Ordinal),
-            t.AssignedTeamId, t.AssignedVehicleId,
-            t.Status == TaskStatus.InProgress && t.StartedAt.HasValue)).ToList();
-
-        var solverRoads = latestByCode.Select(r => new SolverRoad(
-            r.Code, r.FromNodeId, r.ToNodeId, r.TravelTimeMinutes,
-            r.HeightLimitMeters, r.IsOpen, r.RoadSnapshotVersion)).ToList();
-
-        return new SolverSnapshot(solverTeams, solverTasks, solverRoads);
-    }
-
-    private sealed record SolverSnapshot(
-        IReadOnlyList<SolverTeam> Teams,
-        IReadOnlyList<SolverTask> Tasks,
-        IReadOnlyList<SolverRoad> Roads);
+    private static RoadEventDto ToDto(RoadEvent e) => new(
+        e.Id, e.EventId, e.RoadCode, e.Kind.ToString(), e.Reason,
+        e.RoadSnapshotVersionBefore, e.RoadSnapshotVersionAfter,
+        e.OccurredAt, e.RecordedBy);
 }

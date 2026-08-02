@@ -17,20 +17,34 @@ public class AllocationsController : ControllerBase
 
     [HttpPost("initial")]
     [ProducesResponseType(typeof(AllocationVersionDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(SnapshotConflictDto), StatusCodes.Status409Conflict)]
     public async Task<ActionResult<AllocationVersionDto>> Initial(
         [FromBody] SolveRequestDto request, CancellationToken ct)
     {
-        var result = await _allocationService.SolveInitialAsync(request, ct);
-        return Ok(result);
+        try
+        {
+            return Ok(await _allocationService.SolveInitialAsync(request, ct));
+        }
+        catch (SnapshotConflictException ex)
+        {
+            return Conflict(ex.Conflict);
+        }
     }
 
     [HttpPost("rearrange")]
     [ProducesResponseType(typeof(AllocationVersionDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(SnapshotConflictDto), StatusCodes.Status409Conflict)]
     public async Task<ActionResult<AllocationVersionDto>> Rearrange(
         [FromBody] SolveRequestDto request, CancellationToken ct)
     {
-        var result = await _allocationService.RearrangeAsync(request, ct);
-        return Ok(result);
+        try
+        {
+            return Ok(await _allocationService.RearrangeAsync(request, ct));
+        }
+        catch (SnapshotConflictException ex)
+        {
+            return Conflict(ex.Conflict);
+        }
     }
 
     [HttpGet("versions/{id:guid}")]
@@ -52,20 +66,33 @@ public class AllocationsController : ControllerBase
     }
 
     [HttpPost("roads/interrupt")]
-    [ProducesResponseType(StatusCodes.Status204NoContent)]
-    public async Task<IActionResult> Interrupt(
+    [ProducesResponseType(typeof(RoadEventDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<RoadEventDto>> Interrupt(
         [FromBody] RoadInterruptRequestDto request, CancellationToken ct)
     {
-        await _allocationService.InterruptRoadAsync(request, ct);
-        return NoContent();
+        var evt = await _allocationService.InterruptRoadAsync(request, ct);
+        return Ok(evt);
     }
 
     [HttpPost("roads/reopen")]
-    [ProducesResponseType(StatusCodes.Status204NoContent)]
-    public async Task<IActionResult> Reopen(
+    [ProducesResponseType(typeof(RoadEventDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<RoadEventDto>> Reopen(
         [FromBody] RoadReopenRequestDto request, CancellationToken ct)
     {
-        await _allocationService.ReopenRoadAsync(request, ct);
-        return NoContent();
+        var evt = await _allocationService.ReopenRoadAsync(request, ct);
+        return Ok(evt);
     }
+
+    [HttpPost("tasks/escalate")]
+    [ProducesResponseType(typeof(TaskDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<TaskDto>> Escalate(
+        [FromBody] TaskEscalationRequestDto request, CancellationToken ct)
+    {
+        return Ok(await _allocationService.EscalateTaskAsync(request, ct));
+    }
+
+    [HttpGet("snapshots/current")]
+    [ProducesResponseType(typeof(SnapshotDigestDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<SnapshotDigestDto>> CurrentSnapshots(CancellationToken ct)
+        => Ok(await _allocationService.GetCurrentDigestsAsync(ct));
 }

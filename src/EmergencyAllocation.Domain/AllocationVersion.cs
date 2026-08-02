@@ -24,6 +24,24 @@ public class AllocationVersion
 
     public long? RoadSnapshotVersion { get; set; }
 
+    [MaxLength(64)]
+    public string? RoadDigest { get; set; }
+
+    [MaxLength(64)]
+    public string? TaskDigest { get; set; }
+
+    [MaxLength(64)]
+    public string? TeamDigest { get; set; }
+
+    [MaxLength(64)]
+    public string? VehicleDigest { get; set; }
+
+    [MaxLength(128)]
+    public string? RequestPayloadDigest { get; set; }
+
+    [MaxLength(64)]
+    public string? TriggeringRoadEventId { get; set; }
+
     [MaxLength(1024)]
     public string? FailureReason { get; set; }
 

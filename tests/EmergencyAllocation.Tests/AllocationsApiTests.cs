@@ -41,7 +41,7 @@ public class AllocationsApiTests : IClassFixture<WebApplicationFactory<Program>>
         var result = await response.Content.ReadFromJsonAsync<AllocationVersionDto>();
         result.Should().NotBeNull();
         result!.Status.Should().Be("Committed");
-        result.Assignments.Should().Contain(a => a.TaskCode == "LIFE-001" && a.TeamCode == "C" && a.MeetsDeadline);
+        result.Assignments.Should().Contain(a => a.TaskCode == "T1" && a.TeamCode == "C" && a.MeetsDeadline);
         result.Audit.Should().Contain(a => a.Kind == "candidate-reject" && a.VehicleCode == "VA");
     }
 
@@ -51,14 +51,37 @@ public class AllocationsApiTests : IClassFixture<WebApplicationFactory<Program>>
         var client = _factory.CreateClient();
 
         var interrupt = await client.PostAsJsonAsync("/api/allocations/roads/interrupt",
-            new { roadCode = "R2", reason = "flooded", inputVersion = "api-road-v1" });
-        interrupt.StatusCode.Should().Be(HttpStatusCode.NoContent);
+            new { roadCode = "R2", reason = "flooded", inputVersion = "api-road-v1", eventId = "road-r2-closed-01" });
+        interrupt.StatusCode.Should().Be(HttpStatusCode.OK);
+        var evt = await interrupt.Content.ReadFromJsonAsync<RoadEventDto>();
+        evt.Should().NotBeNull();
+        evt!.EventId.Should().Be("road-r2-closed-01");
 
         var rearrange = await client.PostAsJsonAsync("/api/allocations/rearrange",
-            new { inputVersion = "api-rearrange-v1", reason = "R2 flooded" });
+            new { inputVersion = "api-rearrange-v1", reason = "R2 flooded", roadEventId = "road-r2-closed-01" });
         rearrange.StatusCode.Should().Be(HttpStatusCode.OK);
         var result = await rearrange.Content.ReadFromJsonAsync<AllocationVersionDto>();
         result.Should().NotBeNull();
         result!.Status.Should().Be("NoFeasibleSolution");
+        result.TriggeringRoadEventId.Should().Be("road-r2-closed-01");
+    }
+
+    [Fact]
+    public async Task SameInputVersion_DifferentRoadSnapshot_Returns409WithFieldDiff()
+    {
+        var client = _factory.CreateClient();
+        var first = await client.PostAsJsonAsync("/api/allocations/initial",
+            new { inputVersion = "conflict-key" });
+        first.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        await client.PostAsJsonAsync("/api/allocations/roads/interrupt",
+            new { roadCode = "R1", reason = "crash", inputVersion = "r-road-1", eventId = "evt-r1" });
+
+        var retry = await client.PostAsJsonAsync("/api/allocations/initial",
+            new { inputVersion = "conflict-key" });
+        retry.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        var conflict = await retry.Content.ReadFromJsonAsync<SnapshotConflictDto>();
+        conflict.Should().NotBeNull();
+        conflict!.FieldDiffs.Should().Contain(f => f.Field == "roadDigest");
     }
 }

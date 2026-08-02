@@ -53,7 +53,7 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
             bool teamHasAll = assignedTeam is not null && st.RequiredCapabilities.All(assignedTeam.Capabilities.Contains);
             bool canReassign = request.AllowReassign
                                && st.Severity == TaskSeverity.LifeSafety
-                               && (!teamHasAll || blocked);
+                               && (!teamHasAll || blocked || st.SeverityVersion > 1);
 
             if (blocked && !canReassign)
             {
@@ -79,7 +79,7 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
                     busyTeams.Add(candidate.Team.Id);
                     busyVehicles.Add(candidate.Vehicle.Id);
                     Audit("task-reassigned",
-                        $"Started task {st.Code} ({st.Severity}) is reassigned from {assignedTeam.Code} to {candidate.Team.Code} with {candidate.Vehicle.Code} because {(blocked ? "route is blocked" : "severity requires capabilities the current team lacks")}; reason: {request.Reason}.",
+                        $"Started task {st.Code} ({st.Severity}, severityVersion={st.SeverityVersion}) is reassigned from {assignedTeam.Code} to {candidate.Team.Code} with {candidate.Vehicle.Code} because {(blocked ? "route is blocked" : !teamHasAll ? "current team lacks required capabilities" : "severity escalation allows a fully-capable replacement")}; reason: {request.Reason}.",
                         st.Code, candidate.Team.Code, candidate.Vehicle.Code);
                     assignments.Add(new SolverAssignment(
                         st.Id, st.Code, candidate.Team.Id, candidate.Team.Code,
@@ -97,6 +97,13 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
                 Audit("reassign-failed",
                     $"Started task {st.Code} requires reassignment but no fully-capable replacement team is available; keeping {assignedTeam.Code}.",
                     st.Code, assignedTeam.Code, assignedVeh?.Code);
+            }
+
+            if (!blocked)
+            {
+                Audit("task-kept",
+                    $"Started task {st.Code} remains with {assignedTeam?.Code ?? "unassigned"}; cannot be preempted per policy (severity={st.Severity}, allowReassign={request.AllowReassign}).",
+                    st.Code, assignedTeam?.Code, assignedVeh?.Code);
             }
 
             assignments.Add(new SolverAssignment(

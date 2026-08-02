@@ -32,6 +32,7 @@ public static class DependencyInjection
         });
 
         services.AddSingleton<IAllocationSolver, GreedyAllocationSolver>();
+        services.AddSingleton<ISnapshotDigestService, SnapshotDigestService>();
         services.AddScoped<IAllocationService, AllocationService>();
 
         if (seedDemoData)

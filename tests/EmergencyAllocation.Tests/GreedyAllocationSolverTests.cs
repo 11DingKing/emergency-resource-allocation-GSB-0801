@@ -23,13 +23,13 @@ public class GreedyAllocationSolverTests
             new[] { Capabilities.WaterRescue, Capabilities.SlopeInspection, Capabilities.FirstAid },
             3.0, "VC", Seed.TeamCId, Seed.VehCId);
 
-        var life = SolverTestData.PendingTask("LIFE-001", "SITE_LIFE",
+        var life = SolverTestData.PendingTask("T1", "SITE_LIFE",
             TaskSeverity.LifeSafety,
             new[] { Capabilities.WaterRescue, Capabilities.FirstAid },
             45, 35, Seed.TaskLifeId);
 
         var slope = new SolverTask(
-            Seed.TaskSlopeId, "SLOPE-009", "Slope", "SITE_SLOPE",
+            Seed.TaskSlopeId, "T2", "Slope", "SITE_SLOPE",
             TaskSeverity.Urgent, 1, TaskStatus.InProgress, 60, null,
             new[] { Capabilities.SlopeInspection, Capabilities.FirstAid }.ToHashSet(),
             Seed.TeamBId, Seed.VehBId, true);
@@ -46,14 +46,14 @@ public class GreedyAllocationSolverTests
             "initial", false, null));
 
         result.Feasible.Should().BeTrue();
-        var lifeAssignment = result.Assignments.Single(a => a.TaskCode == "LIFE-001");
+        var lifeAssignment = result.Assignments.Single(a => a.TaskCode == "T1");
         lifeAssignment.Decision.Should().Be(AllocationDecision.Assigned);
         lifeAssignment.TeamCode.Should().Be("C");
         lifeAssignment.VehicleCode.Should().Be("VC");
         lifeAssignment.MeetsDeadline.Should().BeTrue();
         lifeAssignment.EstimatedTravelMinutes.Should().Be(22);
 
-        var slopeAssignment = result.Assignments.Single(a => a.TaskCode == "SLOPE-009");
+        var slopeAssignment = result.Assignments.Single(a => a.TaskCode == "T2");
         slopeAssignment.Decision.Should().Be(AllocationDecision.Kept);
         slopeAssignment.TeamCode.Should().Be("B");
     }
@@ -89,11 +89,11 @@ public class GreedyAllocationSolverTests
             new[] { Capabilities.WaterRescue, Capabilities.SlopeInspection, Capabilities.FirstAid },
             3.0, "VC", Seed.TeamCId, Seed.VehCId);
 
-        var life = SolverTestData.PendingTask("LIFE-001", "SITE_LIFE",
+        var life = SolverTestData.PendingTask("T1", "SITE_LIFE",
             TaskSeverity.LifeSafety,
             new[] { Capabilities.WaterRescue, Capabilities.FirstAid }, 45, 35, Seed.TaskLifeId);
         var slope = new SolverTask(
-            Seed.TaskSlopeId, "SLOPE-009", "Slope", "SITE_SLOPE",
+            Seed.TaskSlopeId, "T2", "Slope", "SITE_SLOPE",
             TaskSeverity.Urgent, 1, TaskStatus.InProgress, 60, null,
             new[] { Capabilities.SlopeInspection, Capabilities.FirstAid }.ToHashSet(),
             Seed.TeamBId, Seed.VehBId, true);
@@ -110,7 +110,7 @@ public class GreedyAllocationSolverTests
             "rearrange", true, "R2 flooded"));
 
         result.Feasible.Should().BeFalse();
-        var lifeAssignment = result.Assignments.Single(a => a.TaskCode == "LIFE-001");
+        var lifeAssignment = result.Assignments.Single(a => a.TaskCode == "T1");
         lifeAssignment.Decision.Should().Be(AllocationDecision.Unassigned);
         lifeAssignment.Reason.Should().Contain("R2");
         result.RoadSnapshotVersion.Should().Be(2);
@@ -164,7 +164,7 @@ public class GreedyAllocationSolverTests
             3.0, "VC", Seed.TeamCId, Seed.VehCId);
 
         var slope = new SolverTask(
-            Seed.TaskSlopeId, "SLOPE-009", "Slope", "SITE_SLOPE",
+            Seed.TaskSlopeId, "T2", "Slope", "SITE_SLOPE",
             TaskSeverity.LifeSafety, 2, TaskStatus.InProgress, 60, null,
             new[]
             {
@@ -184,7 +184,7 @@ public class GreedyAllocationSolverTests
             new[] { teamB, teamC }, new[] { slope }, roads, 1, "rearrange",
             true, "Flash flood: water rescue required"));
 
-        var reassigned = result.Assignments.Single(a => a.TaskCode == "SLOPE-009");
+        var reassigned = result.Assignments.Single(a => a.TaskCode == "T2");
         reassigned.Decision.Should().Be(AllocationDecision.Reassigned);
         reassigned.Preempted.Should().BeTrue();
         reassigned.TeamCode.Should().Be("C");
@@ -200,7 +200,7 @@ public class GreedyAllocationSolverTests
             Seed.TeamBId, Seed.VehBId);
 
         var slope = new SolverTask(
-            Seed.TaskSlopeId, "SLOPE-009", "Slope", "SITE_SLOPE",
+            Seed.TaskSlopeId, "T2", "Slope", "SITE_SLOPE",
             TaskSeverity.LifeSafety, 2, TaskStatus.InProgress, 60, null,
             new[] { Capabilities.WaterRescue, Capabilities.SlopeInspection }.ToHashSet(),
             Seed.TeamBId, Seed.VehBId, true);

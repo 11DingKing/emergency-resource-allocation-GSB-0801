@@ -83,7 +83,7 @@ public static class SeedData
     {
         new()
         {
-            Id = TaskLifeId, Code = "LIFE-001", Title = "Trapped resident requiring water rescue + first aid",
+            Id = TaskLifeId, Code = "T1", Title = "Trapped resident requiring water rescue + first aid",
             LocationNodeId = "SITE_LIFE",
             Severity = TaskSeverity.LifeSafety,
             Status = TaskStatus.Pending,
@@ -98,7 +98,7 @@ public static class SeedData
         },
         new()
         {
-            Id = TaskSlopeId, Code = "SLOPE-009", Title = "Slope inspection already assigned to B",
+            Id = TaskSlopeId, Code = "T2", Title = "Slope inspection already assigned to B",
             LocationNodeId = "SITE_SLOPE",
             Severity = TaskSeverity.Urgent,
             Status = TaskStatus.InProgress,
@@ -134,6 +134,12 @@ public static class SeedData
         {
             Id = RoadRBId, Code = "RB", FromNodeId = "BASE_B", ToNodeId = "SITE_SLOPE",
             TravelTimeMinutes = 10, HeightLimitMeters = null, IsOpen = true,
+            RoadSnapshotVersion = 1, UpdatedAt = DateTimeOffset.UtcNow
+        },
+        new()
+        {
+            Id = Guid.NewGuid(), Code = "RC", FromNodeId = "BASE_C", ToNodeId = "SITE_SLOPE",
+            TravelTimeMinutes = 14, HeightLimitMeters = 4.0, IsOpen = true,
             RoadSnapshotVersion = 1, UpdatedAt = DateTimeOffset.UtcNow
         }
     };

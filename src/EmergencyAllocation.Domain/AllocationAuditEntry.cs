@@ -25,6 +25,9 @@ public class AllocationAuditEntry
     [MaxLength(32)]
     public string? RoadCode { get; set; }
 
+    [MaxLength(64)]
+    public string? RoadEventId { get; set; }
+
     [MaxLength(2048)]
     public string Message { get; set; } = string.Empty;
 }
