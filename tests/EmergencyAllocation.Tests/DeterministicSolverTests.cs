@@ -126,7 +126,7 @@ public class DeterministicSolverTests
             HeightLimitMeters = 3.2m, TravelTimeMinutes = 20, IsOpen = true
         };
         var problem = SnapshotBuilder.Build(new List<Team> { teamA }, new List<EmergencyTask> { task },
-            new List<RoadSegment> { road },
+            new List<RoadSegment> { road }, new List<RoadEvent>(),
             new SolverOptions(false, false, _solver.Version), null, "height-test");
 
         var result = await _solver.SolveAsync(problem);
@@ -197,7 +197,7 @@ public class DeterministicSolverTests
             t.Vehicle = vehicles.First(v => v.Id == t.VehicleId);
         }
 
-        var problem = SnapshotBuilder.Build(teams, tasks, roads,
+        var problem = SnapshotBuilder.Build(teams, tasks, roads, new List<RoadEvent>(),
             new SolverOptions(false, false, _solver.Version), null, "tie-test");
 
         var result = await _solver.SolveAsync(problem);
@@ -232,7 +232,7 @@ public class DeterministicSolverTests
             team.Vehicle = vehicles.First(v => v.Id == team.VehicleId);
         }
 
-        return SnapshotBuilder.Build(teams, tasks, roads,
+        return SnapshotBuilder.Build(teams, tasks, roads, new List<RoadEvent>(),
             new SolverOptions(dangerRaised, allowPreemption, "deterministic-1.0"), null, "test-version");
     }
 }

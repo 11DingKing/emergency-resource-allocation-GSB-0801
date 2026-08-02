@@ -32,6 +32,24 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
             .Where(t => t.Status == TaskStatus.InProgress && t.AssignedTeamId is not null)
             .ToList();
 
+        if (!string.IsNullOrEmpty(problem.TriggeringRoadEventId))
+        {
+            var affectedRoad = problem.Roads.FirstOrDefault(r =>
+                string.Equals(r.ClosedByEventId, problem.TriggeringRoadEventId, StringComparison.Ordinal));
+            var affectedTasks = string.Join(",", tasks
+                .Where(t => t.DangerLevel >= DangerLevel.LifeSafety || t.Status == TaskStatus.InProgress)
+                .Select(t => t.Id)
+                .OrderBy(t => t, StringComparer.Ordinal));
+            ruleExplanations.Add(new SolverExplanation(
+                ExplanationKind.RoadBlocked,
+                RuleCodes.RoadClosed,
+                $"道路事件 {problem.TriggeringRoadEventId} 已记录" +
+                (affectedRoad is not null ? $"，路段 {affectedRoad.Id}（{affectedRoad.FromNode}↔{affectedRoad.ToNode}，限高{affectedRoad.HeightLimitMeters}m）被关闭" : string.Empty) +
+                $"；受影响的高风险任务: {affectedTasks}。",
+                null,
+                null));
+        }
+
         var preemptable = DeterminePreemptableTasks(problem, teams, inProgress, ruleExplanations);
         var combinations = EnumeratePreemptionCombinations(inProgress, preemptable);
 
@@ -297,7 +315,7 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
         }
 
         var task = openTasks[taskIndex];
-        var mustAssign = task.DangerLevel == DangerLevel.LifeSafety || task.Status == TaskStatus.InProgress;
+        var mustAssign = task.DangerLevel >= DangerLevel.LifeSafety || task.Status == TaskStatus.InProgress;
         var taskWeight = DangerWeight(task.DangerLevel);
 
         OpenSolution? best = null;
@@ -476,6 +494,7 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
 
     private static long DangerWeight(DangerLevel level) => level switch
     {
+        DangerLevel.Critical => 10_000,
         DangerLevel.LifeSafety => 1000,
         DangerLevel.Elevated => 100,
         DangerLevel.Routine => 10,
@@ -487,7 +506,7 @@ public sealed class DeterministicSchedulingSolver : ISchedulingSolver
         List<TeamState> teams,
         SchedulingProblem problem)
     {
-        var lifeTasks = tasks.Where(t => t.DangerLevel == DangerLevel.LifeSafety).ToList();
+        var lifeTasks = tasks.Where(t => t.DangerLevel >= DangerLevel.LifeSafety).ToList();
         var reasons = new List<string>();
 
         foreach (var task in lifeTasks)

@@ -130,7 +130,11 @@ public static class RoutePlanner
         string toNode,
         List<RoadState> blockedRoads)
     {
-        var closed = blockedRoads.Where(r => !r.IsOpen).Select(r => r.Id).ToList();
+        var closed = blockedRoads.Where(r => !r.IsOpen)
+            .Select(r => string.IsNullOrEmpty(r.ClosedByEventId)
+                ? r.Id
+                : $"{r.Id}(事件{r.ClosedByEventId})")
+            .ToList();
         var tooLow = blockedRoads
             .Where(r => r.IsOpen && vehicleHeightMeters > r.HeightLimitMeters)
             .Select(r => $"{r.Id}(限高{r.HeightLimitMeters}m<车高{vehicleHeightMeters}m)")

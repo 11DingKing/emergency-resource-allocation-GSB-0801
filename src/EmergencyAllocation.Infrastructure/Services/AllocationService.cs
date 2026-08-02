@@ -37,6 +37,11 @@ public sealed class AllocationService : IAllocationService
             previousVersionId: null,
             dangerLevelRaised: false,
             allowPreemption: false,
+            request.ExpectedRoadSnapshotHash,
+            request.ExpectedTaskSnapshotHash,
+            request.ExpectedTeamSnapshotHash,
+            request.ExpectedVehicleSnapshotHash,
+            request.TriggeringRoadEventId,
             cancellationToken);
     }
 
@@ -47,6 +52,11 @@ public sealed class AllocationService : IAllocationService
             previousVersionId: request.PreviousVersionId,
             dangerLevelRaised: request.DangerLevelRaised,
             allowPreemption: true,
+            request.ExpectedRoadSnapshotHash,
+            request.ExpectedTaskSnapshotHash,
+            request.ExpectedTeamSnapshotHash,
+            request.ExpectedVehicleSnapshotHash,
+            request.TriggeringRoadEventId,
             cancellationToken);
     }
 
@@ -82,49 +92,84 @@ public sealed class AllocationService : IAllocationService
         Guid? previousVersionId,
         bool dangerLevelRaised,
         bool allowPreemption,
+        string? expectedRoadHash,
+        string? expectedTaskHash,
+        string? expectedTeamHash,
+        string? expectedVehicleHash,
+        string? triggeringRoadEventId,
         CancellationToken cancellationToken)
     {
         var gate = VersionLocks.GetOrAdd(inputVersion, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken);
         try
         {
-            var existing = await GetByInputVersionAsync(inputVersion, cancellationToken);
-            if (existing is not null)
-            {
-                _logger.LogInformation("Input version {InputVersion} already committed as {VersionId}; returning idempotent result.", inputVersion, existing.VersionId);
-                return existing;
-            }
-
             for (var attempt = 0; attempt < MaxRetries; attempt++)
             {
                 try
                 {
-                    var (teams, tasks, roads) = await LoadSnapshotAsync(cancellationToken);
+                    var snapshot = await LoadSnapshotAsync(cancellationToken);
                     var options = new SolverOptions(dangerLevelRaised, allowPreemption, _solver.Version);
-                    var problem = SnapshotBuilder.Build(teams, tasks, roads, options, previousVersionId, inputVersion);
-                    var snapshotHash = SnapshotBuilder.ComputeHash(problem);
+                    var problem = SnapshotBuilder.Build(
+                        snapshot.Teams, snapshot.Tasks, snapshot.Roads, snapshot.RoadEvents,
+                        options, previousVersionId, inputVersion, triggeringRoadEventId);
+                    var hashes = SnapshotBuilder.ComputeHashes(problem);
 
-                    _logger.LogInformation("Solver attempt {Attempt} for input version {InputVersion} with snapshot {Hash}.", attempt, inputVersion, snapshotHash);
+                    ValidateExpectedHashes(inputVersion, expectedRoadHash, expectedTaskHash, expectedTeamHash,
+                        expectedVehicleHash, hashes);
+
+                    var existing = await GetByInputVersionAsync(inputVersion, cancellationToken);
+                    if (existing is not null)
+                    {
+                        if (existing.SnapshotHash == hashes.Combined)
+                        {
+                            _logger.LogInformation("Input version {InputVersion} already committed with identical snapshot; replaying {VersionId}.",
+                                inputVersion, existing.VersionId);
+                            return existing;
+                        }
+
+                        throw new SnapshotConflictException(BuildIdempotentConflict(inputVersion, existing, hashes, snapshot));
+                    }
+
+                    _logger.LogInformation("Solver attempt {Attempt} for {InputVersion} with snapshot {Hash}.",
+                        attempt, inputVersion, hashes.Combined);
 
                     var solverResult = await _solver.SolveAsync(problem, cancellationToken);
 
-                    var version = BuildVersionEntity(problem, solverResult, snapshotHash);
+                    var version = BuildVersionEntity(problem, solverResult, hashes);
                     await PersistVersionAsync(version, cancellationToken);
                     return Map(version);
                 }
+                catch (SnapshotConflictException)
+                {
+                    throw;
+                }
                 catch (DbUpdateException ex) when (IsUniqueViolation(ex))
                 {
-                    _logger.LogWarning(ex, "Unique violation for input version {InputVersion}; reading winner.", inputVersion);
+                    _logger.LogWarning(ex, "Unique violation for {InputVersion}; reading winner.", inputVersion);
                     var winner = await GetByInputVersionAsync(inputVersion, cancellationToken);
                     if (winner is not null)
                     {
+                        var currentSnapshot = await LoadSnapshotAsync(cancellationToken);
+                        var currentProblem = SnapshotBuilder.Build(
+                            currentSnapshot.Teams, currentSnapshot.Tasks, currentSnapshot.Roads,
+                            currentSnapshot.RoadEvents,
+                            new SolverOptions(dangerLevelRaised, allowPreemption, _solver.Version),
+                            null, inputVersion, triggeringRoadEventId);
+                        var currentHashes = SnapshotBuilder.ComputeHashes(currentProblem);
+                        if (winner.SnapshotHash != currentHashes.Combined)
+                        {
+                            throw new SnapshotConflictException(BuildIdempotentConflict(
+                                inputVersion, winner, currentHashes, currentSnapshot));
+                        }
+
                         return winner;
                     }
                 }
                 catch (Exception ex) when (IsTransient(ex) && attempt < MaxRetries - 1)
                 {
                     var delay = TimeSpan.FromMilliseconds(50 * Math.Pow(2, attempt));
-                    _logger.LogWarning(ex, "Transient failure on attempt {Attempt} for {InputVersion}; retrying in {Delay}ms.", attempt, inputVersion, delay.TotalMilliseconds);
+                    _logger.LogWarning(ex, "Transient failure on attempt {Attempt} for {InputVersion}; retrying in {Delay}ms.",
+                        attempt, inputVersion, delay.TotalMilliseconds);
                     await Task.Delay(delay, cancellationToken);
                 }
             }
@@ -137,7 +182,98 @@ public sealed class AllocationService : IAllocationService
         }
     }
 
-    private async Task<(IReadOnlyList<Team> Teams, IReadOnlyList<EmergencyTask> Tasks, IReadOnlyList<RoadSegment> Roads)> LoadSnapshotAsync(CancellationToken cancellationToken)
+    private static void ValidateExpectedHashes(
+        string inputVersion,
+        string? expectedRoadHash,
+        string? expectedTaskHash,
+        string? expectedTeamHash,
+        string? expectedVehicleHash,
+        SnapshotHashes hashes)
+    {
+        var diffs = new List<FieldDiffDto>();
+        AddIfDiff(diffs, "roads", expectedRoadHash, hashes.Roads, "道路快照与请求绑定的版本不一致");
+        AddIfDiff(diffs, "tasks", expectedTaskHash, hashes.Tasks, "任务快照与请求绑定的版本不一致");
+        AddIfDiff(diffs, "teams", expectedTeamHash, hashes.Teams, "队伍快照与请求绑定的版本不一致");
+        AddIfDiff(diffs, "vehicles", expectedVehicleHash, hashes.Vehicles, "车辆快照与请求绑定的版本不一致");
+
+        if (diffs.Count > 0)
+        {
+            throw new SnapshotConflictException(new SnapshotConflictResponse(
+                inputVersion,
+                "EXPECTED_SNAPSHOT_MISMATCH",
+                "请求绑定的快照版本与当前真实快照不一致，拒绝基于旧快照重放。",
+                ToDto(hashes),
+                null,
+                ToDto(hashes),
+                diffs));
+        }
+    }
+
+    private static void AddIfDiff(List<FieldDiffDto> diffs, string field, string? expected, string actual, string message)
+    {
+        if (expected is not null && !string.Equals(expected, actual, StringComparison.Ordinal))
+        {
+            diffs.Add(new FieldDiffDto(field, expected, actual, message, Array.Empty<string>()));
+        }
+    }
+
+    private static SnapshotConflictResponse BuildIdempotentConflict(
+        string inputVersion,
+        AllocationResult committed,
+        SnapshotHashes currentHashes,
+        SnapshotData snapshot)
+    {
+        var committedHashes = committed.SnapshotHashes;
+        var diffs = new List<FieldDiffDto>();
+
+        AddCommittedDiff(diffs, "roads", committedHashes.Roads, currentHashes.Roads, snapshot, "R");
+        AddCommittedDiff(diffs, "tasks", committedHashes.Tasks, currentHashes.Tasks, snapshot, "T");
+        AddCommittedDiff(diffs, "teams", committedHashes.Teams, currentHashes.Teams, snapshot, "A");
+        AddCommittedDiff(diffs, "vehicles", committedHashes.Vehicles, currentHashes.Vehicles, snapshot, "V");
+
+        return new SnapshotConflictResponse(
+            inputVersion,
+            "INPUT_VERSION_SNAPSHOT_CONFLICT",
+            $"相同 inputVersion '{inputVersion}' 已提交但其绑定快照与当前快照不同，拒绝重放旧方案；请使用新的 inputVersion 重排。",
+            ToDto(currentHashes),
+            committedHashes,
+            ToDto(currentHashes),
+            diffs);
+    }
+
+    private static void AddCommittedDiff(
+        List<FieldDiffDto> diffs,
+        string field,
+        string committedHash,
+        string currentHash,
+        SnapshotData snapshot,
+        string kind)
+    {
+        if (string.Equals(committedHash, currentHash, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var related = kind switch
+        {
+            "R" => snapshot.RoadEvents.Select(e => e.Id)
+                .Concat(snapshot.Roads.Where(r => !r.IsOpen).Select(r => r.Id))
+                .Distinct().ToList(),
+            "T" => snapshot.Tasks.Select(t => t.Id).ToList(),
+            "A" => snapshot.Teams.Select(t => t.Id).ToList(),
+            "V" => snapshot.Teams.Select(t => t.VehicleId).Distinct().ToList(),
+            _ => new List<string>()
+        };
+
+        diffs.Add(new FieldDiffDto(
+            field,
+            committedHash,
+            currentHash,
+            $"已提交版本的 {field} 快照与当前不同",
+            related));
+    }
+
+    private async Task<SnapshotData> LoadSnapshotAsync(CancellationToken cancellationToken)
     {
         await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
         var teams = await context.Teams
@@ -150,7 +286,10 @@ public sealed class AllocationService : IAllocationService
         var roads = await context.RoadSegments
             .AsNoTracking()
             .ToListAsync(cancellationToken);
-        return (teams, tasks, roads);
+        var roadEvents = await context.RoadEvents
+            .AsNoTracking()
+            .ToListAsync(cancellationToken);
+        return new SnapshotData(teams, tasks, roads, roadEvents);
     }
 
     private async Task PersistVersionAsync(AllocationVersion version, CancellationToken cancellationToken)
@@ -181,7 +320,7 @@ public sealed class AllocationService : IAllocationService
     private static AllocationVersion BuildVersionEntity(
         SchedulingProblem problem,
         SolverResult solverResult,
-        string snapshotHash)
+        SnapshotHashes hashes)
     {
         var version = new AllocationVersion
         {
@@ -191,7 +330,12 @@ public sealed class AllocationService : IAllocationService
             Status = AllocationStatus.Committed,
             DangerLevelRaised = problem.Options.DangerLevelRaised,
             SnapshotTakenAt = problem.SnapshotTakenAt,
-            SnapshotHash = snapshotHash,
+            SnapshotHash = hashes.Combined,
+            RoadSnapshotHash = hashes.Roads,
+            TaskSnapshotHash = hashes.Tasks,
+            TeamSnapshotHash = hashes.Teams,
+            VehicleSnapshotHash = hashes.Vehicles,
+            TriggeringRoadEventId = problem.TriggeringRoadEventId,
             SolverVersion = solverResult.SolverVersion,
             TotalCost = solverResult.TotalCost,
             IsFeasible = solverResult.IsFeasible,
@@ -245,6 +389,9 @@ public sealed class AllocationService : IAllocationService
             .FirstOrDefaultAsync(cancellationToken);
     }
 
+    private static SnapshotHashesDto ToDto(SnapshotHashes hashes) =>
+        new(hashes.Combined, hashes.Roads, hashes.Tasks, hashes.Teams, hashes.Vehicles);
+
     private static AllocationResult Map(AllocationVersion version)
     {
         return new AllocationResult(
@@ -256,6 +403,14 @@ public sealed class AllocationService : IAllocationService
             version.SolverVersion,
             version.CreatedAt,
             version.SnapshotHash,
+            new SnapshotHashesDto(
+                version.SnapshotHash,
+                version.RoadSnapshotHash,
+                version.TaskSnapshotHash,
+                version.TeamSnapshotHash,
+                version.VehicleSnapshotHash),
+            version.TriggeringRoadEventId,
+            version.PreviousVersionId,
             version.Assignments
                 .OrderBy(a => a.OrderIndex)
                 .Select(a => new AssignmentDto(
@@ -290,8 +445,8 @@ public sealed class AllocationService : IAllocationService
         {
             return pg.SqlState is PostgresErrorCodes.SerializationFailure
                 or PostgresErrorCodes.DeadlockDetected
-                or "08006" // connection failure
-                or "08001"; // SQL client unable to establish connection
+                or "08006"
+                or "08001";
         }
 
         if (ex is TimeoutException or IOException)
@@ -301,4 +456,10 @@ public sealed class AllocationService : IAllocationService
 
         return false;
     }
+
+    private sealed record SnapshotData(
+        IReadOnlyList<Team> Teams,
+        IReadOnlyList<EmergencyTask> Tasks,
+        IReadOnlyList<RoadSegment> Roads,
+        IReadOnlyList<RoadEvent> RoadEvents);
 }

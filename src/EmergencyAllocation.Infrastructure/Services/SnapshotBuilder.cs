@@ -14,10 +14,16 @@ public static class SnapshotBuilder
         IReadOnlyList<Team> teams,
         IReadOnlyList<EmergencyTask> tasks,
         IReadOnlyList<RoadSegment> roads,
+        IReadOnlyList<RoadEvent> roadEvents,
         SolverOptions options,
         Guid? previousVersionId,
-        string inputVersion)
+        string inputVersion,
+        string? triggeringRoadEventId = null)
     {
+        var latestEventByRoad = roadEvents
+            .GroupBy(e => e.RoadSegmentId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(e => e.OccurredAt).First());
+
         var teamStates = teams
             .OrderBy(t => t.Id, StringComparer.Ordinal)
             .Select(t => new TeamState(
@@ -28,7 +34,7 @@ public static class SnapshotBuilder
                 t.CurrentNode,
                 t.IsAvailable,
                 t.Capabilities.ToHashSet(StringComparer.Ordinal),
-                t.Id is null ? null : GetCurrentTaskId(t.Id, tasks)))
+                GetCurrentTaskId(t.Id, tasks)))
             .ToList();
 
         var taskStates = tasks
@@ -47,14 +53,21 @@ public static class SnapshotBuilder
 
         var roadStates = roads
             .OrderBy(r => r.Id, StringComparer.Ordinal)
-            .Select(r => new RoadState(
-                r.Id,
-                r.Name,
-                r.FromNode,
-                r.ToNode,
-                r.HeightLimitMeters,
-                r.TravelTimeMinutes,
-                r.IsOpen))
+            .Select(r =>
+            {
+                latestEventByRoad.TryGetValue(r.Id, out var evt);
+                var closed = evt is { IsOpen: false };
+                return new RoadState(
+                    r.Id,
+                    r.Name,
+                    r.FromNode,
+                    r.ToNode,
+                    r.HeightLimitMeters,
+                    r.TravelTimeMinutes,
+                    r.IsOpen && !closed,
+                    closed ? evt!.Id : null,
+                    closed ? evt!.Reason : null);
+            })
             .ToList();
 
         return new SchedulingProblem
@@ -65,25 +78,63 @@ public static class SnapshotBuilder
             Roads = roadStates,
             Options = options,
             PreviousVersionId = previousVersionId,
-            SnapshotTakenAt = DateTimeOffset.UtcNow
+            SnapshotTakenAt = DateTimeOffset.UtcNow,
+            TriggeringRoadEventId = triggeringRoadEventId
         };
     }
 
-    public static string ComputeHash(SchedulingProblem problem)
+    public static SnapshotHashes ComputeHashes(SchedulingProblem problem)
     {
-        var canonical = new
-        {
-            teams = problem.Teams
-                .OrderBy(t => t.Id, StringComparer.Ordinal)
-                .Select(t => new { t.Id, t.VehicleId, t.VehicleHeightMeters, t.CurrentNode, t.IsAvailable, caps = t.Capabilities.OrderBy(c => c, StringComparer.Ordinal) }),
-            tasks = problem.Tasks
-                .OrderBy(t => t.Id, StringComparer.Ordinal)
-                .Select(t => new { t.Id, t.LocationNode, t.RequiredArrivalMinutes, t.DangerLevel, t.Status, t.AssignedTeamId, caps = t.RequiredCapabilities.OrderBy(c => c, StringComparer.Ordinal) }),
-            roads = problem.Roads
-                .OrderBy(r => r.Id, StringComparer.Ordinal)
-                .Select(r => new { r.Id, r.FromNode, r.ToNode, r.HeightLimitMeters, r.TravelTimeMinutes, r.IsOpen })
-        };
+        var roads = Hash(problem.Roads
+            .OrderBy(r => r.Id, StringComparer.Ordinal)
+            .Select(r => new
+            {
+                r.Id,
+                r.FromNode,
+                r.ToNode,
+                r.HeightLimitMeters,
+                r.TravelTimeMinutes,
+                r.IsOpen,
+                r.ClosedByEventId,
+                r.ClosedByReason
+            }));
 
+        var tasks = Hash(problem.Tasks
+            .OrderBy(t => t.Id, StringComparer.Ordinal)
+            .Select(t => new
+            {
+                t.Id,
+                t.LocationNode,
+                t.RequiredArrivalMinutes,
+                t.DangerLevel,
+                t.Status,
+                t.AssignedTeamId,
+                caps = t.RequiredCapabilities.OrderBy(c => c, StringComparer.Ordinal)
+            }));
+
+        var teamHash = Hash(problem.Teams
+            .OrderBy(t => t.Id, StringComparer.Ordinal)
+            .Select(t => new
+            {
+                t.Id,
+                t.VehicleId,
+                t.VehicleHeightMeters,
+                t.CurrentNode,
+                t.IsAvailable,
+                caps = t.Capabilities.OrderBy(c => c, StringComparer.Ordinal)
+            }));
+
+        var vehicleHash = Hash(problem.Teams
+            .OrderBy(t => t.VehicleId, StringComparer.Ordinal)
+            .Select(t => new { t.VehicleId, t.VehicleHeightMeters }));
+
+        var combined = Hash(new { roads, tasks, teams = teamHash, vehicles = vehicleHash });
+
+        return new SnapshotHashes(combined, roads, tasks, teamHash, vehicleHash);
+    }
+
+    private static string Hash(object canonical)
+    {
         var json = JsonSerializer.Serialize(canonical, HashOptions);
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
         return Convert.ToHexString(bytes)[..16];

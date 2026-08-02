@@ -26,6 +26,10 @@ public interface IAdministrativeDataService
 
     Task<IReadOnlyList<RoadSegment>> ListRoadsAsync(CancellationToken cancellationToken = default);
 
+    Task<IReadOnlyList<RoadEvent>> ListRoadEventsAsync(string? roadSegmentId = null, CancellationToken cancellationToken = default);
+
+    Task<RoadEvent> RecordRoadEventAsync(RoadEventRequest request, CancellationToken cancellationToken = default);
+
     Task<IReadOnlyList<EmergencyTask>> ListTasksAsync(CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<Team>> ListTeamsAsync(CancellationToken cancellationToken = default);

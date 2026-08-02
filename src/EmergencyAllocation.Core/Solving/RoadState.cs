@@ -7,4 +7,6 @@ public sealed record RoadState(
     string ToNode,
     decimal HeightLimitMeters,
     int TravelTimeMinutes,
-    bool IsOpen);
+    bool IsOpen,
+    string? ClosedByEventId,
+    string? ClosedByReason);

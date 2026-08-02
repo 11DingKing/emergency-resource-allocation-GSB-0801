@@ -121,7 +121,7 @@ public class AllocationServiceTests
         signaling.Release();
         var result = await solveTask;
 
-        Assert.Equal(SnapshotBuilder.ComputeHash(signaling.CapturedProblem!), result.SnapshotHash);
+        Assert.Equal(SnapshotBuilder.ComputeHashes(signaling.CapturedProblem!).Combined, result.SnapshotHash);
         var t1 = Assert.Single(result.Assignments, a => a.TaskId == "T1");
         Assert.Equal("C", t1.TeamId);
         Assert.Equal(20, t1.EstimatedArrivalMinutes);

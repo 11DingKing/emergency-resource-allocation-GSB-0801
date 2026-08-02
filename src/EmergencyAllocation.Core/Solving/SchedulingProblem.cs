@@ -8,5 +8,6 @@ public sealed class SchedulingProblem
     public required IReadOnlyList<RoadState> Roads { get; init; }
     public required SolverOptions Options { get; init; }
     public Guid? PreviousVersionId { get; init; }
+    public string? TriggeringRoadEventId { get; init; }
     public DateTimeOffset SnapshotTakenAt { get; init; } = DateTimeOffset.UtcNow;
 }

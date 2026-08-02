@@ -13,6 +13,7 @@ public class AllocationDbContext : DbContext
     public DbSet<Team> Teams => Set<Team>();
     public DbSet<EmergencyTask> Tasks => Set<EmergencyTask>();
     public DbSet<RoadSegment> RoadSegments => Set<RoadSegment>();
+    public DbSet<RoadEvent> RoadEvents => Set<RoadEvent>();
     public DbSet<AllocationVersion> AllocationVersions => Set<AllocationVersion>();
     public DbSet<TaskAssignment> TaskAssignments => Set<TaskAssignment>();
     public DbSet<AuditExplanation> AuditExplanations => Set<AuditExplanation>();

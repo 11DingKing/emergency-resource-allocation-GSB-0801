@@ -9,6 +9,11 @@ public class AllocationVersion
     public bool DangerLevelRaised { get; set; }
     public DateTimeOffset SnapshotTakenAt { get; set; }
     public string SnapshotHash { get; set; } = string.Empty;
+    public string RoadSnapshotHash { get; set; } = string.Empty;
+    public string TaskSnapshotHash { get; set; } = string.Empty;
+    public string TeamSnapshotHash { get; set; } = string.Empty;
+    public string VehicleSnapshotHash { get; set; } = string.Empty;
+    public string? TriggeringRoadEventId { get; set; }
     public string SolverVersion { get; set; } = string.Empty;
     public long TotalCost { get; set; }
     public bool IsFeasible { get; set; }

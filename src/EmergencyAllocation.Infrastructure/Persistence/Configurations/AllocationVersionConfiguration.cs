@@ -12,6 +12,11 @@ public class AllocationVersionConfiguration : IEntityTypeConfiguration<Allocatio
         builder.Property(a => a.InputVersion).HasMaxLength(128).IsRequired();
         builder.HasIndex(a => a.InputVersion).IsUnique();
         builder.Property(a => a.SnapshotHash).HasMaxLength(128);
+        builder.Property(a => a.RoadSnapshotHash).HasMaxLength(128);
+        builder.Property(a => a.TaskSnapshotHash).HasMaxLength(128);
+        builder.Property(a => a.TeamSnapshotHash).HasMaxLength(128);
+        builder.Property(a => a.VehicleSnapshotHash).HasMaxLength(128);
+        builder.Property(a => a.TriggeringRoadEventId).HasMaxLength(64);
         builder.Property(a => a.SolverVersion).HasMaxLength(64);
         builder.Property(a => a.NoFeasibleReason).HasMaxLength(1024);
         builder.Property(a => a.Status).HasConversion<string>().HasMaxLength(32);

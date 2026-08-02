@@ -17,6 +17,7 @@ public class AllocationsController : ControllerBase
 
     [HttpPost("initial")]
     [ProducesResponseType(typeof(AllocationResult), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(SnapshotConflictResponse), StatusCodes.Status409Conflict)]
     public async Task<IActionResult> SolveInitial([FromBody] InitialSolveRequest request, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(request.InputVersion))
@@ -24,12 +25,20 @@ public class AllocationsController : ControllerBase
             return BadRequest("inputVersion is required.");
         }
 
-        var result = await _allocationService.SolveInitialAsync(request, cancellationToken);
-        return Ok(result);
+        try
+        {
+            var result = await _allocationService.SolveInitialAsync(request, cancellationToken);
+            return Ok(result);
+        }
+        catch (SnapshotConflictException ex)
+        {
+            return Conflict(ex.Response);
+        }
     }
 
     [HttpPost("rearrange")]
     [ProducesResponseType(typeof(AllocationResult), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(SnapshotConflictResponse), StatusCodes.Status409Conflict)]
     public async Task<IActionResult> Rearrange([FromBody] RearrangeRequest request, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(request.InputVersion))
@@ -37,8 +46,15 @@ public class AllocationsController : ControllerBase
             return BadRequest("inputVersion is required.");
         }
 
-        var result = await _allocationService.RearrangeAsync(request, cancellationToken);
-        return Ok(result);
+        try
+        {
+            var result = await _allocationService.RearrangeAsync(request, cancellationToken);
+            return Ok(result);
+        }
+        catch (SnapshotConflictException ex)
+        {
+            return Conflict(ex.Response);
+        }
     }
 
     [HttpGet("latest")]

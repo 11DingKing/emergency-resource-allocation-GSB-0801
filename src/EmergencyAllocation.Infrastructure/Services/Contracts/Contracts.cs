@@ -1,18 +1,36 @@
 namespace EmergencyAllocation.Infrastructure.Services.Contracts;
 
-public sealed record InitialSolveRequest(string InputVersion);
+public sealed record InitialSolveRequest(
+    string InputVersion,
+    string? ExpectedRoadSnapshotHash = null,
+    string? ExpectedTaskSnapshotHash = null,
+    string? ExpectedTeamSnapshotHash = null,
+    string? ExpectedVehicleSnapshotHash = null,
+    string? TriggeringRoadEventId = null);
 
 public sealed record RearrangeRequest(
     string InputVersion,
     Guid PreviousVersionId,
-    bool DangerLevelRaised);
+    bool DangerLevelRaised,
+    string? ExpectedRoadSnapshotHash = null,
+    string? ExpectedTaskSnapshotHash = null,
+    string? ExpectedTeamSnapshotHash = null,
+    string? ExpectedVehicleSnapshotHash = null,
+    string? TriggeringRoadEventId = null);
+
+public sealed record RoadEventRequest(
+    string EventId,
+    bool IsOpen,
+    string Reason,
+    string? RecordedBy = null);
 
 public sealed record RoadUpdateRequest(bool? IsOpen);
 
 public sealed record TaskStateUpdateRequest(
-    EmergencyAllocation.Core.TaskStatus Status,
-    string? AssignedTeamId,
-    string? CurrentNode);
+    EmergencyAllocation.Core.TaskStatus? Status = null,
+    string? AssignedTeamId = null,
+    string? CurrentNode = null,
+    EmergencyAllocation.Core.DangerLevel? DangerLevel = null);
 
 public sealed record AssignmentDto(
     string TaskId,
@@ -32,6 +50,29 @@ public sealed record ExplanationDto(
     string? RelatedTaskId,
     string? RelatedTeamId);
 
+public sealed record SnapshotHashesDto(
+    string Combined,
+    string Roads,
+    string Tasks,
+    string Teams,
+    string Vehicles);
+
+public sealed record FieldDiffDto(
+    string Field,
+    string? ExpectedHash,
+    string? ActualHash,
+    string Message,
+    IReadOnlyList<string> RelatedEntities);
+
+public sealed record SnapshotConflictResponse(
+    string InputVersion,
+    string ConflictType,
+    string Message,
+    SnapshotHashesDto RequestedHashes,
+    SnapshotHashesDto? CommittedHashes,
+    SnapshotHashesDto CurrentHashes,
+    IReadOnlyList<FieldDiffDto> FieldDiffs);
+
 public sealed record AllocationResult(
     Guid VersionId,
     string InputVersion,
@@ -41,5 +82,8 @@ public sealed record AllocationResult(
     string SolverVersion,
     DateTimeOffset CreatedAt,
     string SnapshotHash,
+    SnapshotHashesDto SnapshotHashes,
+    string? TriggeringRoadEventId,
+    Guid? PreviousVersionId,
     IReadOnlyList<AssignmentDto> Assignments,
     IReadOnlyList<ExplanationDto> Explanations);

@@ -37,6 +37,52 @@ public sealed class AdministrativeDataService : IAdministrativeDataService
         await context.SaveChangesAsync(cancellationToken);
     }
 
+    public async Task<RoadEvent> RecordRoadEventAsync(RoadEventRequest request, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+        var roadSegmentId = ExtractRoadSegmentId(request.EventId);
+        var road = await context.RoadSegments.FirstOrDefaultAsync(r => r.Id == roadSegmentId, cancellationToken);
+        if (road is null)
+        {
+            throw new KeyNotFoundException($"Road segment '{roadSegmentId}' not found for event '{request.EventId}'.");
+        }
+
+        var existing = await context.RoadEvents.FirstOrDefaultAsync(e => e.Id == request.EventId, cancellationToken);
+        if (existing is not null)
+        {
+            throw new InvalidOperationException($"Road event '{request.EventId}' already recorded.");
+        }
+
+        var evt = new RoadEvent
+        {
+            Id = request.EventId,
+            RoadSegmentId = road.Id,
+            IsOpen = request.IsOpen,
+            Reason = request.Reason,
+            OccurredAt = DateTimeOffset.UtcNow,
+            RecordedBy = request.RecordedBy
+        };
+
+        road.IsOpen = request.IsOpen;
+        context.RoadEvents.Add(evt);
+        await context.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation("Road event {EventId} recorded for {RoadId}; open={IsOpen}.", request.EventId, road.Id, request.IsOpen);
+        return evt;
+    }
+
+    public async Task<IReadOnlyList<RoadEvent>> ListRoadEventsAsync(string? roadSegmentId = null, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+        var query = context.RoadEvents.AsNoTracking().AsQueryable();
+        if (!string.IsNullOrEmpty(roadSegmentId))
+        {
+            query = query.Where(e => e.RoadSegmentId == roadSegmentId);
+        }
+
+        return await query.OrderBy(e => e.OccurredAt).ToListAsync(cancellationToken);
+    }
+
     public async Task UpdateTaskAsync(string taskId, TaskStateUpdateRequest request, CancellationToken cancellationToken = default)
     {
         await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
@@ -46,10 +92,19 @@ public sealed class AdministrativeDataService : IAdministrativeDataService
             throw new KeyNotFoundException($"Task '{taskId}' not found.");
         }
 
-        task.Status = request.Status;
+        if (request.Status.HasValue)
+        {
+            task.Status = request.Status.Value;
+        }
+
         if (request.AssignedTeamId is not null)
         {
             task.AssignedTeamId = request.AssignedTeamId;
+        }
+
+        if (request.DangerLevel.HasValue)
+        {
+            task.DangerLevel = request.DangerLevel.Value;
         }
 
         if (request.CurrentNode is not null)
@@ -93,5 +148,16 @@ public sealed class AdministrativeDataService : IAdministrativeDataService
     {
         await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
         return await context.Teams.AsNoTracking().Include(t => t.Vehicle).OrderBy(t => t.Id).ToListAsync(cancellationToken);
+    }
+
+    private static string ExtractRoadSegmentId(string eventId)
+    {
+        var parts = eventId.Split('-', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 3 && parts[0].Equals("road", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts[1].ToUpperInvariant();
+        }
+
+        return eventId;
     }
 }

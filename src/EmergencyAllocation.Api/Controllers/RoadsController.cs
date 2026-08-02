@@ -23,6 +23,37 @@ public class RoadsController : ControllerBase
         return Ok(await _dataService.ListRoadsAsync(cancellationToken));
     }
 
+    [HttpGet("events")]
+    [ProducesResponseType(typeof(IReadOnlyList<RoadEvent>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> ListEvents([FromQuery] string? roadSegmentId, CancellationToken cancellationToken)
+    {
+        return Ok(await _dataService.ListRoadEventsAsync(roadSegmentId, cancellationToken));
+    }
+
+    [HttpPost("events")]
+    [ProducesResponseType(typeof(RoadEvent), StatusCodes.Status201Created)]
+    public async Task<IActionResult> RecordEvent([FromBody] RoadEventRequest request, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.EventId))
+        {
+            return BadRequest("eventId is required.");
+        }
+
+        try
+        {
+            var evt = await _dataService.RecordRoadEventAsync(request, cancellationToken);
+            return CreatedAtAction(nameof(ListEvents), new { roadSegmentId = evt.RoadSegmentId }, evt);
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Conflict(ex.Message);
+        }
+    }
+
     [HttpPatch("{roadId}")]
     public async Task<IActionResult> Update(string roadId, [FromBody] RoadUpdateRequest request, CancellationToken cancellationToken)
     {
