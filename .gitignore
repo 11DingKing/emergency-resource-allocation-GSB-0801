@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+
+# Rider / VS
+.idea/
+.vs/
+*.user
+
+# EF tools local
+# (dotnet-tools manifest is committed under .config/)
+
+# OS
+.DS_Store
