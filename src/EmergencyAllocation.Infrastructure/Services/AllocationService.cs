@@ -70,7 +70,10 @@ public sealed class AllocationService : IAllocationService
         var payloadDigest = _digests.ComputePayloadDigest(
             operation, request.InputVersion, request.Reason, request.RoadEventId);
 
-        for (int attempt = 0; attempt < 3; attempt++)
+        await using var strategyCtx = await _contextFactory.CreateDbContextAsync(ct);
+        var strategy = strategyCtx.Database.CreateExecutionStrategy();
+
+        return await strategy.ExecuteAsync(async () =>
         {
             await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
             await using var tx = await ctx.Database.BeginTransactionAsync(
@@ -85,6 +88,8 @@ public sealed class AllocationService : IAllocationService
                     .FirstOrDefaultAsync(ct);
 
                 var (teams, vehicles, tasks, roads, currentDigests) = await LoadStateAsync(ctx, ct);
+
+                ValidateExpectedDigests(request, currentDigests);
 
                 if (existing is not null && IsTerminal(existing.Status))
                 {
@@ -135,8 +140,6 @@ public sealed class AllocationService : IAllocationService
                         operation, idempotencyKey, existing.Id);
                     return await MapVersionAsync(existing.Id, ct);
                 }
-
-                ValidateExpectedDigests(request, currentDigests);
 
                 if (existing is not null && existing.Status == AllocationVersionStatus.Pending)
                 {
@@ -301,24 +304,12 @@ public sealed class AllocationService : IAllocationService
 
                 return await MapVersionAsync(version.Id, ct);
             }
-            catch (DbUpdateException ex) when (IsTransient(ex) && attempt < 2)
+            catch (Exception) when (ctx.Database.CurrentTransaction is not null)
             {
-                _logger.LogWarning(ex,
-                    "Transient update conflict on {Operation} attempt {Attempt}; retrying.", operation, attempt);
                 await tx.RollbackAsync(ct);
-                continue;
+                throw;
             }
-            catch (NpgsqlException ex) when (ex.IsTransient && attempt < 2)
-            {
-                _logger.LogWarning(ex,
-                    "Transient Npgsql failure on {Operation} attempt {Attempt}; retrying.", operation, attempt);
-                await tx.RollbackAsync(ct);
-                continue;
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Failed to commit allocation for {operation} after retries (idempotency key={idempotencyKey}).");
+        });
     }
 
     private void ValidateExpectedDigests(SolveRequestDto request, SnapshotDigests current)
@@ -412,7 +403,10 @@ public sealed class AllocationService : IAllocationService
         if (string.IsNullOrWhiteSpace(inputVersion))
             throw new ArgumentException("InputVersion is required.", nameof(inputVersion));
 
-        for (int attempt = 0; attempt < 3; attempt++)
+        await using var strategyCtx = await _contextFactory.CreateDbContextAsync(ct);
+        var strategy = strategyCtx.Database.CreateExecutionStrategy();
+
+        return await strategy.ExecuteAsync(async () =>
         {
             await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
             await using var tx = await ctx.Database.BeginTransactionAsync(
@@ -457,13 +451,12 @@ public sealed class AllocationService : IAllocationService
                 await tx.CommitAsync(ct);
                 return ToDto(evt);
             }
-            catch (DbUpdateException ex) when (IsTransient(ex) && attempt < 2)
+            catch (Exception) when (ctx.Database.CurrentTransaction is not null)
             {
                 await tx.RollbackAsync(ct);
-                continue;
+                throw;
             }
-        }
-        throw new InvalidOperationException("Failed to update road after retries.");
+        });
     }
 
     public async Task<TaskDto> EscalateTaskAsync(TaskEscalationRequestDto request, CancellationToken ct = default)
@@ -473,7 +466,10 @@ public sealed class AllocationService : IAllocationService
         if (!Enum.TryParse<TaskSeverity>(request.TargetSeverity, ignoreCase: true, out var target))
             throw new ArgumentException($"Unknown severity {request.TargetSeverity}", nameof(request));
 
-        for (int attempt = 0; attempt < 3; attempt++)
+        await using var strategyCtx = await _contextFactory.CreateDbContextAsync(ct);
+        var strategy = strategyCtx.Database.CreateExecutionStrategy();
+
+        return await strategy.ExecuteAsync(async () =>
         {
             await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
             await using var tx = await ctx.Database.BeginTransactionAsync(
@@ -498,13 +494,120 @@ public sealed class AllocationService : IAllocationService
                     task.StartedAt,
                     task.RequiredCapabilities.Select(c => c.Capability).OrderBy(x => x).ToList());
             }
-            catch (DbUpdateException ex) when (IsTransient(ex) && attempt < 2)
+            catch (Exception) when (ctx.Database.CurrentTransaction is not null)
             {
                 await tx.RollbackAsync(ct);
+                throw;
             }
-        }
-        throw new InvalidOperationException("Failed to escalate task after retries.");
+        });
     }
+
+    public async Task<TaskDto> StartTaskAsync(TaskStartRequestDto request, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.InputVersion))
+            throw new ArgumentException("InputVersion is required.", nameof(request));
+
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
+        var task = await ctx.Tasks.Include(t => t.RequiredCapabilities)
+            .FirstOrDefaultAsync(t => t.Code == request.TaskCode, ct);
+        if (task is null) throw new KeyNotFoundException($"Task {request.TaskCode} not found.");
+
+        task.Status = TaskStatus.InProgress;
+        task.StartedAt ??= DateTimeOffset.UtcNow;
+        await ctx.SaveChangesAsync(ct);
+
+        return ToTaskDto(task);
+    }
+
+    public async Task<TaskDto> CompleteTaskAsync(TaskCompleteRequestDto request, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.InputVersion))
+            throw new ArgumentException("InputVersion is required.", nameof(request));
+
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
+        var task = await ctx.Tasks.Include(t => t.RequiredCapabilities)
+            .FirstOrDefaultAsync(t => t.Code == request.TaskCode, ct);
+        if (task is null) throw new KeyNotFoundException($"Task {request.TaskCode} not found.");
+
+        task.Status = TaskStatus.Completed;
+        task.CompletedAt = DateTimeOffset.UtcNow;
+        await ctx.SaveChangesAsync(ct);
+
+        return ToTaskDto(task);
+    }
+
+    public async Task<AllocationVersionDiffDto> DiffVersionsAsync(Guid fromVersionId, Guid toVersionId, CancellationToken ct = default)
+    {
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct);
+        var from = await ctx.AllocationVersions.AsNoTracking()
+            .Include(v => v.Assignments).ThenInclude(a => a.Task)
+            .Include(v => v.Assignments).ThenInclude(a => a.Team)
+            .Include(v => v.Assignments).ThenInclude(a => a.Vehicle)
+            .FirstOrDefaultAsync(v => v.Id == fromVersionId, ct);
+        var to = await ctx.AllocationVersions.AsNoTracking()
+            .Include(v => v.Assignments).ThenInclude(a => a.Task)
+            .Include(v => v.Assignments).ThenInclude(a => a.Team)
+            .Include(v => v.Assignments).ThenInclude(a => a.Vehicle)
+            .FirstOrDefaultAsync(v => v.Id == toVersionId, ct);
+        if (from is null || to is null) throw new KeyNotFoundException("One or both versions not found.");
+
+        var fromAssignments = from.Assignments.ToDictionary(a => a.TaskId);
+        var toAssignments = to.Assignments.ToDictionary(a => a.TaskId);
+        var taskCodes = from.Assignments.Select(a => a.Task?.Code ?? a.TaskId.ToString())
+            .Concat(to.Assignments.Select(a => a.Task?.Code ?? a.TaskId.ToString()))
+            .Distinct(StringComparer.Ordinal).ToList();
+
+        var assignmentDiffs = new List<AssignmentDiffDto>();
+        foreach (var code in taskCodes.OrderBy(x => x, StringComparer.Ordinal))
+        {
+            var fa = from.Assignments.FirstOrDefault(a => (a.Task?.Code ?? a.TaskId.ToString()) == code);
+            var ta = to.Assignments.FirstOrDefault(a => (a.Task?.Code ?? a.TaskId.ToString()) == code);
+            if (fa is null || ta is null) continue;
+
+            var changed = fa.Decision != ta.Decision
+                          || fa.TeamId != ta.TeamId
+                          || fa.VehicleId != ta.VehicleId
+                          || fa.EstimatedTravelMinutes != ta.EstimatedTravelMinutes;
+            if (!changed) continue;
+
+            assignmentDiffs.Add(new AssignmentDiffDto(
+                code,
+                fa.Decision.ToString(), ta.Decision.ToString(),
+                fa.Team?.Code, ta.Team?.Code,
+                fa.Vehicle?.Code, ta.Vehicle?.Code,
+                fa.EstimatedTravelMinutes, ta.EstimatedTravelMinutes,
+                ta.Preempted,
+                ta.Reason));
+        }
+
+        var snapshotDiffs = new List<FieldDiffDto>();
+        void AddDiff(string field, string? expected, string? actual, string detail)
+        {
+            if (!string.Equals(expected ?? string.Empty, actual ?? string.Empty, StringComparison.Ordinal))
+                snapshotDiffs.Add(new FieldDiffDto(field, expected, actual, detail));
+        }
+        AddDiff("roadDigest", from.RoadDigest, to.RoadDigest, "Road snapshot changed between versions.");
+        AddDiff("taskDigest", from.TaskDigest, to.TaskDigest, "Task snapshot changed between versions.");
+        AddDiff("teamDigest", from.TeamDigest, to.TeamDigest, "Team snapshot changed between versions.");
+        AddDiff("vehicleDigest", from.VehicleDigest, to.VehicleDigest, "Vehicle snapshot changed between versions.");
+
+        var summary = $"From {from.Status} (snapshot {from.RoadSnapshotVersion}) to {to.Status} (snapshot {to.RoadSnapshotVersion}); " +
+                      $"{assignmentDiffs.Count} assignment difference(s), {snapshotDiffs.Count} snapshot digest difference(s).";
+
+        return new AllocationVersionDiffDto(
+            from.Id, to.Id, from.Status.ToString(), to.Status.ToString(),
+            from.RoadSnapshotVersion, to.RoadSnapshotVersion,
+            from.RoadDigest, to.RoadDigest,
+            assignmentDiffs, snapshotDiffs, summary);
+    }
+
+    private static TaskDto ToTaskDto(EmergencyTask task) => new(
+        task.Id, task.Code, task.Title, task.LocationNodeId,
+        task.Severity.ToString(), task.Status.ToString(),
+        task.DurationMinutes, task.DeadlineMinutes,
+        task.SeverityVersion, task.AssignedTeamId, task.AssignedVehicleId,
+        task.StartedAt,
+        task.RequiredCapabilities.Select(c => c.Capability).OrderBy(x => x).ToList());
 
     public async Task<SnapshotDigestDto> GetCurrentDigestsAsync(CancellationToken ct = default)
     {

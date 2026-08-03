@@ -306,13 +306,16 @@ public class AllocationServiceIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task T2Preempted_OnlyWhenLifeSafetyAndFullyCapableReplacement()
+    public async Task T2Preempted_WhenRouteBlockedAndFullyCapableReplacementExists()
     {
         var svc = _provider.GetRequiredService<IAllocationService>();
+        await svc.InterruptRoadAsync(new RoadInterruptRequestDto(
+            "RB", "Landslide blocks access", "rb-block", "road-rb-blocked-01"));
         await svc.EscalateTaskAsync(new TaskEscalationRequestDto(
             "T2", "LifeSafety", "esc-t2", "Slope collapse with trapped person"));
 
-        var v = await svc.RearrangeAsync(new SolveRequestDto("t2-preempt", "escalation"));
+        var v = await svc.RearrangeAsync(new SolveRequestDto("t2-preempt", "RB blocked; T2 critical",
+            RoadEventId: "road-rb-blocked-01"));
 
         var t2 = v.Assignments.Single(a => a.TaskCode == "T2");
         t2.Decision.Should().Be("Reassigned");
@@ -320,6 +323,30 @@ public class AllocationServiceIntegrationTests : IDisposable
         t2.TeamCode.Should().Be("C");
         t2.PreviousTeamId.Should().Be(TestSeed.TeamBId);
         v.Audit.Should().Contain(a => a.Kind == "task-reassigned" && a.TaskCode == "T2");
+    }
+
+    [Fact]
+    public async Task ExecutedTask_NotMovedWhenEtaShorterAfterRoadReopens()
+    {
+        var svc = _provider.GetRequiredService<IAllocationService>();
+
+        await svc.InterruptRoadAsync(new RoadInterruptRequestDto("R2", "flood", "r2-closed", "road-r2-closed-01"));
+        var blocked = await svc.RearrangeAsync(new SolveRequestDto("round2", "R2 closed",
+            RoadEventId: "road-r2-closed-01"));
+        blocked.Status.Should().Be("NoFeasibleSolution");
+
+        await svc.ReopenRoadAsync(new RoadReopenRequestDto("R2", "flood receded", "r2-open", "road-r2-open-02"));
+
+        var started = svc.StartTaskAsync(new TaskStartRequestDto("T1", "start-t1", Guid.NewGuid()));
+        await started;
+
+        var reopened = await svc.RearrangeAsync(new SolveRequestDto("r2-reopened-v2", "R2 reopened",
+            RoadEventId: "road-r2-open-02"));
+        reopened.Status.Should().Be("Committed");
+
+        var t1 = reopened.Assignments.Single(a => a.TaskCode == "T1");
+        t1.Decision.Should().Be("Kept");
+        t1.Preempted.Should().BeFalse();
     }
 
     [Fact]
@@ -331,6 +358,42 @@ public class AllocationServiceIntegrationTests : IDisposable
         var after = await svc.GetCurrentDigestsAsync();
         after.Road.Should().NotBe(before.Road);
         after.RoadSnapshotVersion.Should().BeGreaterThan(before.RoadSnapshotVersion);
+    }
+
+    [Fact]
+    public async Task OldSnapshotMissingRoadEvent_Returns409ViaExpectedDigest()
+    {
+        var svc = _provider.GetRequiredService<IAllocationService>();
+        var before = await svc.GetCurrentDigestsAsync();
+
+        await svc.InterruptRoadAsync(new RoadInterruptRequestDto("R2", "flood", "r2-closed", "road-r2-closed-01"));
+
+        var act = () => svc.RearrangeAsync(new SolveRequestDto("stale-snapshot", "stale",
+            ExpectedRoadDigest: before.Road,
+            ExpectedRoadSnapshotVersion: before.RoadSnapshotVersion));
+        var ex = await act.Should().ThrowAsync<SnapshotConflictException>();
+        ex.Which.Conflict.FieldDiffs.Should().Contain(f => f.Field == "roadDigest");
+        ex.Which.Conflict.FieldDiffs.Should().Contain(f => f.Field == "roadSnapshotVersion");
+    }
+
+    [Fact]
+    public async Task DiffVersions_ReturnsTraceableAssignmentAndSnapshotChanges()
+    {
+        var svc = _provider.GetRequiredService<IAllocationService>();
+        var round2 = await svc.RearrangeAsync(new SolveRequestDto("diff-round2", "initial rearrange"));
+
+        await svc.InterruptRoadAsync(new RoadInterruptRequestDto("R2", "flood", "r2-close-diff", "road-r2-closed-diff"));
+        await svc.EscalateTaskAsync(new TaskEscalationRequestDto("T1", "LifeSafety", "esc-diff", "critical"));
+        var round3 = await svc.RearrangeAsync(new SolveRequestDto("diff-round3", "after event",
+            RoadEventId: "road-r2-closed-diff"));
+
+        var diff = await svc.DiffVersionsAsync(round2.Id, round3.Id);
+        diff.FromVersionId.Should().Be(round2.Id);
+        diff.ToVersionId.Should().Be(round3.Id);
+        diff.SnapshotDiffs.Should().Contain(s => s.Field == "roadDigest"
+            || s.Field == "taskDigest");
+        diff.AssignmentDiffs.Should().NotBeEmpty();
+        diff.Summary.Should().Contain("assignment difference");
     }
 
     public void Dispose()

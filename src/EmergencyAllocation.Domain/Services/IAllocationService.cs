@@ -11,5 +11,8 @@ public interface IAllocationService
     Task<RoadEventDto> InterruptRoadAsync(RoadInterruptRequestDto request, CancellationToken ct = default);
     Task<RoadEventDto> ReopenRoadAsync(RoadReopenRequestDto request, CancellationToken ct = default);
     Task<TaskDto> EscalateTaskAsync(TaskEscalationRequestDto request, CancellationToken ct = default);
+    Task<TaskDto> StartTaskAsync(TaskStartRequestDto request, CancellationToken ct = default);
+    Task<TaskDto> CompleteTaskAsync(TaskCompleteRequestDto request, CancellationToken ct = default);
+    Task<AllocationVersionDiffDto> DiffVersionsAsync(Guid fromVersionId, Guid toVersionId, CancellationToken ct = default);
     Task<SnapshotDigestDto> GetCurrentDigestsAsync(CancellationToken ct = default);
 }

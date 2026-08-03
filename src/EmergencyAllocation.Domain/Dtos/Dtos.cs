@@ -31,6 +31,42 @@ public sealed record TaskEscalationRequestDto(
     string InputVersion,
     string? Reason = null);
 
+public sealed record TaskStartRequestDto(
+    string TaskCode,
+    string InputVersion,
+    Guid? PerformedBy = null);
+
+public sealed record TaskCompleteRequestDto(
+    string TaskCode,
+    string InputVersion,
+    string? Outcome = null);
+
+public sealed record AllocationVersionDiffDto(
+    Guid FromVersionId,
+    Guid ToVersionId,
+    string FromStatus,
+    string ToStatus,
+    long? FromRoadSnapshot,
+    long? ToRoadSnapshot,
+    string? FromRoadDigest,
+    string? ToRoadDigest,
+    IReadOnlyList<AssignmentDiffDto> AssignmentDiffs,
+    IReadOnlyList<FieldDiffDto> SnapshotDiffs,
+    string Summary);
+
+public sealed record AssignmentDiffDto(
+    string TaskCode,
+    string FromDecision,
+    string ToDecision,
+    string? FromTeam,
+    string? ToTeam,
+    string? FromVehicle,
+    string? ToVehicle,
+    int FromTravelMinutes,
+    int ToTravelMinutes,
+    bool Preempted,
+    string? Reason);
+
 public sealed record AssignmentDto(
     Guid TaskId,
     string TaskCode,

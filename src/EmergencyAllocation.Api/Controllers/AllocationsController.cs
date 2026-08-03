@@ -91,6 +91,38 @@ public class AllocationsController : ControllerBase
         return Ok(await _allocationService.EscalateTaskAsync(request, ct));
     }
 
+    [HttpPost("tasks/start")]
+    [ProducesResponseType(typeof(TaskDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<TaskDto>> Start(
+        [FromBody] TaskStartRequestDto request, CancellationToken ct)
+    {
+        return Ok(await _allocationService.StartTaskAsync(request, ct));
+    }
+
+    [HttpPost("tasks/complete")]
+    [ProducesResponseType(typeof(TaskDto), StatusCodes.Status200OK)]
+    public async Task<ActionResult<TaskDto>> Complete(
+        [FromBody] TaskCompleteRequestDto request, CancellationToken ct)
+    {
+        return Ok(await _allocationService.CompleteTaskAsync(request, ct));
+    }
+
+    [HttpGet("versions/{fromId:guid}/diff/{toId:guid}")]
+    [ProducesResponseType(typeof(AllocationVersionDiffDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<AllocationVersionDiffDto>> Diff(
+        Guid fromId, Guid toId, CancellationToken ct)
+    {
+        try
+        {
+            return Ok(await _allocationService.DiffVersionsAsync(fromId, toId, ct));
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+    }
+
     [HttpGet("snapshots/current")]
     [ProducesResponseType(typeof(SnapshotDigestDto), StatusCodes.Status200OK)]
     public async Task<ActionResult<SnapshotDigestDto>> CurrentSnapshots(CancellationToken ct)

@@ -53,7 +53,7 @@ public sealed class GreedyAllocationSolver : IAllocationSolver
             bool teamHasAll = assignedTeam is not null && st.RequiredCapabilities.All(assignedTeam.Capabilities.Contains);
             bool canReassign = request.AllowReassign
                                && st.Severity == TaskSeverity.LifeSafety
-                               && (!teamHasAll || blocked || st.SeverityVersion > 1);
+                               && (!teamHasAll || blocked);
 
             if (blocked && !canReassign)
             {
